@@ -1,0 +1,20 @@
+[package]
+name = "dctenc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.36"
+egui = "0.36"
+wgpu = "30"
+bytemuck = { version = "1.16", features = ["derive"] }
+pollster = "1"
+anyhow = "1"
+rfd = "0.17"
+ffmpeg-next = "9"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+codegen-units = 1
