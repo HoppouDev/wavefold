@@ -1,3 +1,4 @@
+use dctenc::encoders::EncoderChoice;
 use dctenc::pipeline::{self, PipelineMsg};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
@@ -6,6 +7,7 @@ struct App {
     input: Option<PathBuf>,
     output: Option<PathBuf>,
     cutoff: f32,
+    encoder: EncoderChoice,
     running: bool,
     progress_current: u64,
     progress_total: u64,
@@ -19,6 +21,7 @@ impl Default for App {
             input: None,
             output: None,
             cutoff: 0.6,
+            encoder: EncoderChoice::H264,
             running: false,
             progress_current: 0,
             progress_total: 0,
@@ -32,6 +35,7 @@ impl App {
     fn start_encode(&mut self) {
         let (Some(input), Some(output)) = (self.input.clone(), self.output.clone()) else { return };
         let cutoff = self.cutoff;
+        let encoder = self.encoder;
         let (tx, rx): (Sender<PipelineMsg>, Receiver<PipelineMsg>) = std::sync::mpsc::channel();
         self.rx = Some(rx);
         self.running = true;
@@ -39,7 +43,7 @@ impl App {
         self.progress_total = 0;
         self.log.clear();
         std::thread::spawn(move || {
-            pipeline::run(&input, &output, cutoff, tx);
+            pipeline::run(&input, &output, cutoff, encoder, tx);
         });
     }
 
@@ -82,7 +86,7 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("DCT GPU Video Encoder");
-            ui.label("Distortion effect: transforms each entire frame as one whole-image DCT (cosine basis), keeps only the lowest-frequency coefficients, then re-encodes with ffmpeg (libx264). Dropping detail this way produces global ringing/ghosting across the whole frame rather than blocky artifacts.");
+            ui.label("Distortion effect: transforms each entire frame as one whole-image DCT (cosine basis), keeps only the lowest-frequency coefficients, then re-encodes with ffmpeg. Dropping detail this way produces global ringing/ghosting across the whole frame rather than blocky artifacts.");
             ui.separator();
 
             ui.horizontal(|ui| {
@@ -113,6 +117,17 @@ impl eframe::App for App {
             ui.separator();
             ui.add(egui::Slider::new(&mut self.cutoff, 0.0..=2.0).text("DCT spectrum cutoff"));
             ui.label("0 = DC only (max distortion, strong global ringing/ghosting). 2.0 = full spectrum (lossless).");
+
+            ui.horizontal(|ui| {
+                ui.label("Encoder:");
+                egui::ComboBox::from_id_salt("encoder")
+                    .selected_text(self.encoder.label())
+                    .show_ui(ui, |ui| {
+                        for choice in EncoderChoice::ALL {
+                            ui.selectable_value(&mut self.encoder, choice, choice.label());
+                        }
+                    });
+            });
 
             ui.separator();
             let can_start = self.input.is_some() && self.output.is_some() && !self.running;

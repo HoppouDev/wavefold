@@ -73,7 +73,7 @@ fn encodes_synthetic_clip_end_to_end() {
     let (tx, rx) = mpsc::channel();
     let input2 = input.clone();
     let output2 = output.clone();
-    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, tx));
+    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, dctenc::encoders::EncoderChoice::H264, tx));
 
     let mut saw_done = false;
     let mut saw_error = None;
@@ -114,7 +114,7 @@ fn reports_error_for_nonexistent_input() {
     let (tx, rx) = mpsc::channel();
     let out2 = output.clone();
     let handle = std::thread::spawn(move || {
-        pipeline::run(std::path::Path::new("/nonexistent/dctenc_missing_input.mp4"), &out2, 0.32, tx)
+        pipeline::run(std::path::Path::new("/nonexistent/dctenc_missing_input.mp4"), &out2, 0.32, dctenc::encoders::EncoderChoice::H264, tx)
     });
 
     let mut saw_error = false;
@@ -155,7 +155,7 @@ fn encodes_synthetic_clip_with_audio_end_to_end() {
     let (tx, rx) = mpsc::channel();
     let input2 = input.clone();
     let output2 = output.clone();
-    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, tx));
+    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, dctenc::encoders::EncoderChoice::H264, tx));
 
     let mut saw_done = false;
     let mut saw_error = None;
@@ -185,4 +185,51 @@ fn encodes_synthetic_clip_with_audio_end_to_end() {
 
     let _ = std::fs::remove_file(&input);
     let _ = std::fs::remove_file(&output);
+}
+
+#[test]
+fn encodes_with_every_selectable_encoder() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    if dctenc::gpu::DctGpu::new().is_err() {
+        eprintln!("skipping: no GPU adapter available");
+        return;
+    }
+
+    for choice in dctenc::encoders::EncoderChoice::ALL {
+        let input = make_test_clip(32, 24, 6, 1); // 6 frames
+        let output = unique_path("out_encoder.mp4");
+
+        let (tx, rx) = mpsc::channel();
+        let input2 = input.clone();
+        let output2 = output.clone();
+        let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.5, choice, tx));
+
+        let mut saw_done = false;
+        let mut saw_error = None;
+        for msg in rx {
+            match msg {
+                PipelineMsg::Error(e) => saw_error = Some(e),
+                PipelineMsg::Done => saw_done = true,
+                _ => {}
+            }
+        }
+        handle.join().unwrap();
+
+        if let Some(e) = saw_error {
+            panic!("{:?} failed: {e}", choice);
+        }
+        assert!(saw_done, "{:?} never sent Done", choice);
+        assert!(output.exists(), "{:?} produced no output file", choice);
+
+        let (w, h, frames) = probe_dims_and_frames(&output);
+        assert_eq!(w, 32, "{:?} wrong width", choice);
+        assert_eq!(h, 24, "{:?} wrong height", choice);
+        assert_eq!(frames, 6, "{:?} wrong frame count", choice);
+
+        let _ = std::fs::remove_file(&input);
+        let _ = std::fs::remove_file(&output);
+    }
 }

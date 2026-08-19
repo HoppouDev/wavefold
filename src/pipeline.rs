@@ -1,3 +1,4 @@
+use crate::encoders::EncoderChoice;
 use crate::gpu::DctGpu;
 use anyhow::{anyhow, bail, Context, Result};
 use ffmpeg_next as ff;
@@ -28,8 +29,8 @@ enum WorkItem {
     Error(String),
 }
 
-pub fn run(input: &Path, output: &Path, cutoff: f32, tx: Sender<PipelineMsg>) {
-    if let Err(e) = run_inner(input, output, cutoff, &tx) {
+pub fn run(input: &Path, output: &Path, cutoff: f32, encoder_choice: EncoderChoice, tx: Sender<PipelineMsg>) {
+    if let Err(e) = run_inner(input, output, cutoff, encoder_choice, &tx) {
         error!("pipeline failed: {e:#}");
         let _ = tx.send(PipelineMsg::Error(format!("{e:#}")));
     }
@@ -112,7 +113,13 @@ fn join_rgb_planes(width: u32, height: u32, r: &[f32], g: &[f32], b: &[f32]) -> 
     frame
 }
 
-fn run_inner(input_path: &Path, output_path: &Path, cutoff: f32, tx: &Sender<PipelineMsg>) -> Result<()> {
+fn run_inner(
+    input_path: &Path,
+    output_path: &Path,
+    cutoff: f32,
+    encoder_choice: EncoderChoice,
+    tx: &Sender<PipelineMsg>,
+) -> Result<()> {
     ff::init()?;
 
     info!(path = %input_path.display(), "opening input");
@@ -196,7 +203,9 @@ fn run_inner(input_path: &Path, output_path: &Path, cutoff: f32, tx: &Sender<Pip
     )?;
 
     let mut octx = ff::format::output(output_path)?;
-    let codec = ff::encoder::find(ff::codec::Id::H264).ok_or_else(|| anyhow!("no H264 encoder available"))?;
+    let profile = encoder_choice.profile();
+    let codec = ff::encoder::find_by_name(profile.codec_name)
+        .ok_or_else(|| anyhow!("encoder '{}' not available in this ffmpeg build", profile.codec_name))?;
     debug!(codec = codec.name(), "video encoder selected");
 
     let enc_time_base = ff::Rational::new(frame_rate.denominator(), frame_rate.numerator().max(1));
@@ -204,25 +213,28 @@ fn run_inner(input_path: &Path, output_path: &Path, cutoff: f32, tx: &Sender<Pip
     let mut enc_ctx = ff::codec::context::Context::new_with_codec(codec).encoder().video()?;
     enc_ctx.set_width(width);
     enc_ctx.set_height(height);
-    enc_ctx.set_format(Pixel::YUV420P);
+    enc_ctx.set_format(profile.pixel_format);
     enc_ctx.set_time_base(enc_time_base);
     enc_ctx.set_frame_rate(Some(frame_rate));
-    // Must match the "bf=0" x264 option below: if AVCodecContext.max_b_frames
-    // disagrees with what libx264 actually does, the mp4 muxer computes the
-    // wrong reorder delay and writes an edit list that silently trims frames.
+    // No B-frames, applied uniformly regardless of which encoder was picked:
+    // frames are processed independently by the DCT pass anyway, and
+    // B-frame reordering was producing a negative initial DTS that the mp4
+    // muxer silently dropped on the first packet. AVCodecContext.max_b_frames
+    // must agree with the encoder-specific option below, or the mp4 muxer
+    // computes the wrong reorder delay and writes an edit list that
+    // silently trims frames.
     enc_ctx.set_max_b_frames(0);
     if octx.format().flags().contains(ff::format::Flags::GLOBAL_HEADER) {
         enc_ctx.set_flags(ff::codec::Flags::GLOBAL_HEADER);
     }
 
-    let mut x264_opts = ff::Dictionary::new();
-    x264_opts.set("preset", "medium");
-    // No B-frames: frames are processed independently by the DCT pass anyway,
-    // and B-frame reordering was producing a negative initial DTS that the
-    // mp4 muxer silently dropped on the first packet.
-    x264_opts.set("bf", "0");
+    let mut encoder_opts = ff::Dictionary::new();
+    for (key, value) in profile.options {
+        encoder_opts.set(key, value);
+    }
+    encoder_opts.set("bf", "0");
 
-    let mut encoder = enc_ctx.open_as_with(codec, x264_opts)?;
+    let mut encoder = enc_ctx.open_as_with(codec, encoder_opts)?;
 
     let mut vost = octx.add_stream(codec)?;
     vost.set_parameters(&encoder);
@@ -269,7 +281,7 @@ fn run_inner(input_path: &Path, output_path: &Path, cutoff: f32, tx: &Sender<Pip
         Pixel::RGB24,
         width,
         height,
-        Pixel::YUV420P,
+        profile.pixel_format,
         width,
         height,
         ScaleFlags::BILINEAR,
