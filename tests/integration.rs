@@ -1,5 +1,5 @@
-use dctenc::dct_backend::ComputeBackend;
-use dctenc::pipeline::{self, PipelineMsg};
+use wavefold::dct_backend::ComputeBackend;
+use wavefold::pipeline::{self, PipelineMsg};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
@@ -11,7 +11,7 @@ fn ffmpeg_available() -> bool {
 fn unique_path(suffix: &str) -> std::path::PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("dctenc_integration_{}_{}_{}", std::process::id(), id, suffix))
+    std::env::temp_dir().join(format!("wavefold_integration_{}_{}_{}", std::process::id(), id, suffix))
 }
 
 fn make_test_clip(width: u32, height: u32, fps: u32, seconds: u32) -> std::path::PathBuf {
@@ -63,7 +63,7 @@ fn encodes_synthetic_clip_end_to_end() {
         eprintln!("skipping: ffmpeg not available");
         return;
     }
-    if dctenc::gpu::DctGpu::new().is_err() {
+    if wavefold::gpu::DctGpu::new().is_err() {
         eprintln!("skipping: no GPU adapter available");
         return;
     }
@@ -74,7 +74,7 @@ fn encodes_synthetic_clip_end_to_end() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let input2 = input.clone();
     let output2 = output.clone();
-    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, dctenc::encoders::EncoderChoice::H264, ComputeBackend::Gpu, tx));
+    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, wavefold::encoders::EncoderChoice::H264, ComputeBackend::Gpu, tx));
 
     let mut saw_done = false;
     let mut saw_error = None;
@@ -122,7 +122,7 @@ fn encodes_synthetic_clip_with_cpu_backend() {
     let input2 = input.clone();
     let output2 = output.clone();
     let handle = std::thread::spawn(move || {
-        pipeline::run(&input2, &output2, 0.4, dctenc::encoders::EncoderChoice::H264, ComputeBackend::Cpu, tx)
+        pipeline::run(&input2, &output2, 0.4, wavefold::encoders::EncoderChoice::H264, ComputeBackend::Cpu, tx)
     });
 
     let mut saw_done = false;
@@ -161,7 +161,7 @@ fn reports_error_for_nonexistent_input() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let out2 = output.clone();
     let handle = std::thread::spawn(move || {
-        pipeline::run(std::path::Path::new("/nonexistent/dctenc_missing_input.mp4"), &out2, 0.32, dctenc::encoders::EncoderChoice::H264, ComputeBackend::Gpu, tx)
+        pipeline::run(std::path::Path::new("/nonexistent/wavefold_missing_input.mp4"), &out2, 0.32, wavefold::encoders::EncoderChoice::H264, ComputeBackend::Gpu, tx)
     });
 
     let mut saw_error = false;
@@ -181,7 +181,7 @@ fn encodes_synthetic_clip_with_audio_end_to_end() {
         eprintln!("skipping: ffmpeg not available");
         return;
     }
-    if dctenc::gpu::DctGpu::new().is_err() {
+    if wavefold::gpu::DctGpu::new().is_err() {
         eprintln!("skipping: no GPU adapter available");
         return;
     }
@@ -202,7 +202,7 @@ fn encodes_synthetic_clip_with_audio_end_to_end() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let input2 = input.clone();
     let output2 = output.clone();
-    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, dctenc::encoders::EncoderChoice::H264, ComputeBackend::Gpu, tx));
+    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, wavefold::encoders::EncoderChoice::H264, ComputeBackend::Gpu, tx));
 
     let mut saw_done = false;
     let mut saw_error = None;
@@ -240,12 +240,12 @@ fn encodes_with_every_selectable_encoder() {
         eprintln!("skipping: ffmpeg not available");
         return;
     }
-    if dctenc::gpu::DctGpu::new().is_err() {
+    if wavefold::gpu::DctGpu::new().is_err() {
         eprintln!("skipping: no GPU adapter available");
         return;
     }
 
-    for choice in dctenc::encoders::EncoderChoice::ALL {
+    for choice in wavefold::encoders::EncoderChoice::ALL {
         // VAAPI encoders reject frames below their minimum coded size
         // (e.g. h264_vaapi on this system reports a 128x128 floor), so
         // this clip is larger than the other encoder tests' — small
@@ -255,7 +255,7 @@ fn encodes_with_every_selectable_encoder() {
         // CTU boundary (160 -> 192) without writing a correct SPS
         // conformance-window crop back, so the muxed output's probed width
         // silently comes out padded — confirmed directly with gst-launch,
-        // a genuine driver limitation, not a dctenc bug. Staying
+        // a genuine driver limitation, not a wavefold bug. Staying
         // 64-aligned sidesteps it (no padding needed) rather than papering
         // over a wrong-dimension output with a tolerant skip.
         let input = make_test_clip(192, 128, 6, 1); // 6 frames
@@ -292,8 +292,8 @@ fn encodes_with_every_selectable_encoder() {
             // changed this), while `qtmux`'s `video/x-vp9` pad template
             // requires that field, so the two can never negotiate. VP9 into
             // matroskamux (no such requirement) works fine — this is a
-            // muxer-specific gap, not a real dctenc bug.
-            if choice.profile().hardware || matches!(choice, dctenc::encoders::EncoderChoice::Vp9) {
+            // muxer-specific gap, not a real wavefold bug.
+            if choice.profile().hardware || matches!(choice, wavefold::encoders::EncoderChoice::Vp9) {
                 eprintln!("skipping {choice:?}: {e}");
                 let _ = std::fs::remove_file(&input);
                 continue;
@@ -313,26 +313,6 @@ fn encodes_with_every_selectable_encoder() {
     }
 }
 
-#[test]
-fn debug_real_file_probe() {
-    let input = std::path::Path::new("/home/admin/Videos/0000-0250.mkv");
-    let output = unique_path("debug_real_out.mp4");
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let out2 = output.clone();
-    let handle = std::thread::spawn(move || {
-        pipeline::run(input, &out2, 0.6, dctenc::encoders::EncoderChoice::H264, ComputeBackend::Gpu, tx)
-    });
-    while let Some(msg) = rx.blocking_recv() {
-        match msg {
-            PipelineMsg::Log(l) => eprintln!("LOG: {l}"),
-            PipelineMsg::Error(e) => eprintln!("ERROR: {e}"),
-            PipelineMsg::Done => eprintln!("DONE"),
-            PipelineMsg::Progress { current, total } => eprintln!("PROGRESS {current}/{total}"),
-        }
-    }
-    handle.join().unwrap();
-}
-
 /// Regression test for a real-world failure: some containers (this repros
 /// with a plain lavfi-generated pcm_s16le-in-mkv clip, same as e.g. some
 /// camera-recorded mkv files) don't record an explicit audio channel
@@ -348,7 +328,7 @@ fn encodes_clip_with_unspecified_channel_layout_audio() {
         eprintln!("skipping: ffmpeg not available");
         return;
     }
-    if dctenc::gpu::DctGpu::new().is_err() {
+    if wavefold::gpu::DctGpu::new().is_err() {
         eprintln!("skipping: no GPU adapter available");
         return;
     }
@@ -381,7 +361,7 @@ fn encodes_clip_with_unspecified_channel_layout_audio() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let input2 = input.clone();
     let output2 = output.clone();
-    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, dctenc::encoders::EncoderChoice::H264, ComputeBackend::Gpu, tx));
+    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, wavefold::encoders::EncoderChoice::H264, ComputeBackend::Gpu, tx));
 
     let mut saw_done = false;
     let mut saw_error = None;
@@ -419,7 +399,7 @@ fn estimates_total_frames_from_format_duration_when_stream_metadata_missing() {
         eprintln!("skipping: ffmpeg not available");
         return;
     }
-    if dctenc::gpu::DctGpu::new().is_err() {
+    if wavefold::gpu::DctGpu::new().is_err() {
         eprintln!("skipping: no GPU adapter available");
         return;
     }
@@ -453,7 +433,7 @@ fn estimates_total_frames_from_format_duration_when_stream_metadata_missing() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let input2 = input.clone();
     let output2 = output.clone();
-    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, dctenc::encoders::EncoderChoice::H264, ComputeBackend::Gpu, tx));
+    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, wavefold::encoders::EncoderChoice::H264, ComputeBackend::Gpu, tx));
 
     let mut saw_done = false;
     let mut saw_error = None;

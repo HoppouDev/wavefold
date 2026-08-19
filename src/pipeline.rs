@@ -524,8 +524,8 @@ mod tests {
     #[test]
     fn errors_on_missing_input() {
         let result = super::run_inner(
-            std::path::Path::new("/nonexistent/dctenc_test_input.mp4"),
-            std::path::Path::new("/tmp/dctenc_test_output_never_created.mp4"),
+            std::path::Path::new("/nonexistent/wavefold_test_input.mp4"),
+            std::path::Path::new("/tmp/wavefold_test_output_never_created.mp4"),
             0.6,
             crate::encoders::EncoderChoice::H264,
             crate::dct_backend::ComputeBackend::Cpu,

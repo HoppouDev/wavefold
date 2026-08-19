@@ -1,6 +1,6 @@
-use dctenc::dct_backend::ComputeBackend;
-use dctenc::encoders::EncoderChoice;
-use dctenc::pipeline::{self, PipelineMsg};
+use wavefold::dct_backend::ComputeBackend;
+use wavefold::encoders::EncoderChoice;
+use wavefold::pipeline::{self, PipelineMsg};
 use iced::widget::{button, column, progress_bar, scrollable, text};
 use iced::{Element, Fill, Task};
 use std::path::PathBuf;

@@ -89,7 +89,7 @@ impl DctGpu {
         debug!(name = %adapter_info.name, backend = ?adapter_info.backend, "GPU adapter selected");
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("dctenc device"),
+            label: Some("wavefold device"),
             required_features: wgpu::Features::empty(),
             required_limits: wgpu::Limits::default(),
             memory_hints: wgpu::MemoryHints::default(),

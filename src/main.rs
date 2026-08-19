@@ -1,14 +1,14 @@
 mod ui;
 
 use clap::{Parser, Subcommand};
-use dctenc::dct_backend::ComputeBackend;
-use dctenc::encoders::EncoderChoice;
-use dctenc::pipeline::{self, PipelineMsg};
+use wavefold::dct_backend::ComputeBackend;
+use wavefold::encoders::EncoderChoice;
+use wavefold::pipeline::{self, PipelineMsg};
 use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "dctenc", about = "Apply a whole-frame DCT distortion effect to video — GUI or headless")]
+#[command(name = "wavefold", about = "Apply a whole-frame DCT distortion effect to video — GUI or headless")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -53,7 +53,7 @@ fn main() {
 
 fn run_gui() -> iced::Result {
     iced::application(ui::App::default, ui::App::update, ui::App::view)
-        .title("DCT GPU Video Encoder")
+        .title("Wavefold")
         .window_size((640.0, 640.0))
         .run()
 }

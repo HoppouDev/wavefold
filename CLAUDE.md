@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`dctenc` — a single native Rust binary (desktop GUI via iced, or headless via
+`wavefold` — a single native Rust binary (desktop GUI via iced, or headless via
 a `clap` subcommand) that applies a whole-frame DCT "distortion" effect to
 video: decode → per-frame DCT compress/reconstruct on a user-selectable
 compute backend (GPU via wgpu, or a pure-CPU fallback) → re-encode with a
@@ -27,13 +27,13 @@ installed GStreamer versions without that problem.
 ## Commands
 
 ```bash
-cargo build --release                             # release build: single dctenc binary
-dctenc                                            # launch the iced GUI (default with no subcommand)
-dctenc gui                                        # same, explicit
-dctenc encode <in> <out> [--cutoff F] [--encoder ...] [--backend gpu|cpu]  # headless, no display server needed
-cargo check                                       # fast typecheck, iterate with this first
-cargo test --release                              # unit tests (gpu.rs, cpu.rs, dct_math.rs, pipeline.rs) + tests/integration.rs
-cargo test --release <name>                       # run a single test by substring, e.g. `cargo test --release roundtrip`
+cargo build --release                          # release build: single wavefold binary
+wavefold                                       # launch the iced GUI (default with no subcommand)
+wavefold gui                                   # same, explicit
+wavefold encode <in> <out> [--cutoff F] [--encoder ...] [--backend gpu|cpu]  # headless, no display server needed
+cargo check                                    # fast typecheck, iterate with this first
+cargo test --release                           # unit tests (gpu.rs, cpu.rs, dct_math.rs, pipeline.rs) + tests/integration.rs
+cargo test --release <name>                    # run a single test by substring, e.g. `cargo test --release roundtrip`
 ```
 
 GPU tests (in `src/gpu.rs`, plus the cross-check test in `src/cpu.rs`)
@@ -45,7 +45,7 @@ backend needs no GPU at all. `tests/integration.rs` shells out to the
 `ffmpeg` CLI (not `ffmpeg-next`) purely to generate synthetic test-fixture
 clips; it also skips gracefully if `ffmpeg` isn't on `PATH`.
 
-`.github/workflows/ci.yml` runs `dctenc encode --backend cpu` on a plain
+`.github/workflows/ci.yml` runs `wavefold encode --backend cpu` on a plain
 `ubuntu-latest` runner (no container workaround needed — see the "What this
 is" section above for why the GStreamer rewrite is specifically what made
 that possible).
@@ -95,7 +95,7 @@ same basis math in `dct_math.rs` → (GPU only) `shader.wgsl`.
 
 - **`src/lib.rs`** re-exports `pub mod cpu; pub mod dct_backend; mod
   dct_math; pub mod encoders; pub mod gpu; pub mod pipeline;` so both the
-  `dctenc` binary (`main.rs`/`ui/`) and `tests/integration.rs` link against
+  `wavefold` binary (`main.rs`/`ui/`) and `tests/integration.rs` link against
   the same public API — this split exists specifically so the pipeline can
   be exercised without a GUI. `dct_math` is deliberately *not* `pub` — it's
   `pub(crate)` plumbing shared only between `gpu.rs` and `cpu.rs`, not part
@@ -109,17 +109,17 @@ same basis math in `dct_math.rs` → (GPU only) `shader.wgsl`.
   encoder, backend }`. `run_gui()` is the same
   `iced::application(ui::App::default, ui::App::update, ui::App::view).run()`
   bootstrap the binary always had; `run_encode(...)` is the former
-  `dctenc-cli` binary's body verbatim — spawns `pipeline::run` on a
+  `wavefold-cli` binary's body verbatim — spawns `pipeline::run` on a
   `std::thread` exactly like `ui/encoding.rs` does (it's a blocking call,
   not async), then drives the `tokio::sync::mpsc` receiver on the main
   thread with `rx.blocking_recv()` (works fine with no tokio runtime
   present, which is exactly what `blocking_recv` is for), exiting `1` on
   `PipelineMsg::Error`. Merging both entry points into one binary means the
   `encode` subcommand now always links `iced`/`wgpu` too (they were
-  previously a separate `dctenc-cli` binary that skipped that dependency
+  previously a separate `wavefold-cli` binary that skipped that dependency
   weight) — harmless, since `run_gui()` is simply never called on that
   path; no window/GPU surface is touched unless the `Gui` branch runs. This
-  is the binary `.github/workflows/ci.yml` runs as `dctenc encode --backend
+  is the binary `.github/workflows/ci.yml` runs as `wavefold encode --backend
   cpu` on a GPU-less runner.
 
 - **`src/dct_backend.rs`** — `DctBackend` (the trait `gpu.rs`'s `DctGpu` and

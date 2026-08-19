@@ -1,5 +1,5 @@
-use dctenc::dct_backend::ComputeBackend;
-use dctenc::encoders::EncoderChoice;
+use wavefold::dct_backend::ComputeBackend;
+use wavefold::encoders::EncoderChoice;
 use iced::widget::{button, column, pick_list, row, slider, text};
 use iced::{Element, Task};
 use std::path::PathBuf;
@@ -114,7 +114,7 @@ impl State {
         let start_button = button("Encode").on_press_maybe(can_start.then_some(Message::Start));
 
         column![
-            text("DCT GPU Video Encoder").size(24),
+            text("Wavefold").size(24),
             text("Distortion effect: transforms each entire frame as one whole-image DCT (cosine basis), keeps only the lowest-frequency coefficients, then re-encodes with ffmpeg. Dropping detail this way produces global ringing/ghosting across the whole frame rather than blocky artifacts."),
             input_row,
             output_row,
