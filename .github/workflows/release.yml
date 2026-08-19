@@ -94,9 +94,9 @@ jobs:
       - name: Install GStreamer (MSVC, complete/devel)
         shell: pwsh
         run: |
-          Start-Process -FilePath .\gst-installer.exe -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/TYPE=full","/DIR=C:\gstreamer" -Wait
-          if ($LASTEXITCODE -ne 0) {
-            throw "GStreamer installer exited with code $LASTEXITCODE"
+          $proc = Start-Process -FilePath .\gst-installer.exe -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/TYPE=full","/DIR=C:\gstreamer" -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+            throw "GStreamer installer exited with code $($proc.ExitCode)"
           }
           echo "C:\gstreamer\bin" >> $env:GITHUB_PATH
           echo "PKG_CONFIG_PATH=C:\gstreamer\lib\pkgconfig" >> $env:GITHUB_ENV
@@ -157,9 +157,9 @@ jobs:
       - name: Install GStreamer (MSVC, complete/devel)
         shell: pwsh
         run: |
-          Start-Process -FilePath .\gst-installer.exe -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/TYPE=full","/DIR=C:\gstreamer" -Wait
-          if ($LASTEXITCODE -ne 0) {
-            throw "GStreamer installer exited with code $LASTEXITCODE"
+          $proc = Start-Process -FilePath .\gst-installer.exe -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/TYPE=full","/DIR=C:\gstreamer" -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+            throw "GStreamer installer exited with code $($proc.ExitCode)"
           }
           echo "C:\gstreamer\bin" >> $env:GITHUB_PATH
           echo "PKG_CONFIG_PATH=C:\gstreamer\lib\pkgconfig" >> $env:GITHUB_ENV
