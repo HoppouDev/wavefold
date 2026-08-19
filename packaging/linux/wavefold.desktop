@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Wavefold
+Comment=Apply a whole-frame DCT distortion effect to video
+Exec=wavefold
+Icon=wavefold
+Terminal=false
+Categories=AudioVideo;Video;
+StartupWMClass=wavefold

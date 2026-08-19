@@ -130,6 +130,20 @@ end-to-end like the Linux distros above:
 VAAPI is Linux-only; on Windows only the software encoders (x264/x265/vp9/av1)
 are available.
 
+### Linux desktop shortcut
+
+A `.desktop` file and app icon are in [`packaging/linux`](packaging/linux):
+
+```bash
+cp packaging/linux/wavefold.desktop ~/.local/share/applications/
+mkdir -p ~/.local/share/icons/hicolor/scalable/apps
+cp packaging/linux/icons/hicolor/scalable/apps/wavefold.svg ~/.local/share/icons/hicolor/scalable/apps/
+update-desktop-database ~/.local/share/applications 2>/dev/null
+gtk-update-icon-cache ~/.local/share/icons/hicolor 2>/dev/null
+```
+
+Requires the `wavefold` binary on `PATH`.
+
 ## Run
 
 ```bash
