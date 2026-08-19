@@ -20,10 +20,20 @@ pub enum PipelineMsg {
     Error(String),
 }
 
-/// One unit of demuxed/decoded work handed from the producer thread (demux +
-/// decode) to the consumer (scale + GPU DCT + encode + mux), preserving the
-/// original interleave order via the channel's FIFO delivery.
+/// One unit of demuxed/decoded work handed from the decode stage to the GPU
+/// stage, preserving the original interleave order via the channel's FIFO
+/// delivery.
 enum WorkItem {
+    Video(VideoFrame),
+    Audio(ff::Packet),
+    Eof,
+    Error(String),
+}
+
+/// One unit of GPU-processed work handed from the GPU stage to the
+/// encode+mux stage. `Video` is already scaled into the encoder's pixel
+/// format and PTS-tagged — the encode stage only has to send it.
+enum EncodeItem {
     Video(VideoFrame),
     Audio(ff::Packet),
     Eof,
@@ -288,18 +298,22 @@ fn run_inner(
         ScaleFlags::BILINEAR,
     )?;
 
-    // Producer/consumer split: demuxing and decoding (stateful, CPU-bound
-    // libavcodec work) run on a dedicated thread and feed a bounded channel,
-    // so decode of frame N+1 can overlap with this thread's scale + GPU DCT
-    // wait + encode of frame N instead of the two serializing on one thread
-    // (which is why the GPU previously sat idle during every scale/encode
-    // step). `libswscale`'s `Context` (`to_rgb`/`from_rgb`) is not `Send`,
-    // so scaling stays here on the consumer side; the channel's FIFO order
-    // preserves the original demux interleave for both video and audio, so
-    // no separate reordering step is needed.
+    // Three-stage pipeline — decode / GPU DCT / encode+mux — connected by
+    // two bounded channels, so each stage's work overlaps with the others
+    // instead of serializing on one thread (which is why the GPU previously
+    // sat idle during scale/encode, and the encoder sat idle during the GPU
+    // wait). Decode and encode+mux each get their own spawned thread below;
+    // *this* calling thread stays as the GPU stage in the middle, because
+    // `libswscale`'s `Context` (`to_rgb`/`from_rgb`) is not `Send` and so
+    // can never move into a spawned closure — `encoder`/`octx` (needed
+    // downstream) are `Send`, so it's the encode+mux stage that gets
+    // spawned off instead, not the GPU stage. Both channels' FIFO order
+    // preserves the original demux interleave for video and audio, so no
+    // separate reordering is needed.
     //
-    // `ictx`/`decoder` are only moved into the producer closure below, not
-    // used again on this thread afterward.
+    // `ictx`/`decoder` are only moved into the decode-stage closure below;
+    // `encoder`/`octx` only into the encode-stage closure further down.
+    // Neither is used again on this (GPU-stage) thread afterward.
     let audio_in_time_base = match audio_stream_index {
         Some(idx) => Some(ictx.stream(idx).context("audio input stream disappeared after being located")?.time_base()),
         None => None,
@@ -370,63 +384,115 @@ fn run_inner(
         result
     });
 
+    // Encode+mux stage runs on a *new* spawned thread instead of this one:
+    // `encoder`/`octx` are `Send` (unlike the `Scaler`s above), so they're
+    // what moves. This stage owns everything downstream of GPU processing —
+    // including the final `send_eof`/`write_trailer` — and reports the
+    // final frame count back through its `JoinHandle` once this (GPU-stage)
+    // thread joins it below.
+    let (encode_tx, encode_rx) = std::sync::mpsc::sync_channel::<EncodeItem>(2);
+    let encode_stage = std::thread::spawn(move || -> Result<i64> {
+        let mut frame_idx: i64 = 0;
+        loop {
+            match encode_rx.recv() {
+                Ok(EncodeItem::Video(yuv)) => {
+                    encoder.send_frame(&yuv)?;
+                    drain_encoder(&mut encoder, &mut octx, video_ost_index, ost_time_base)?;
+                    frame_idx += 1;
+                }
+                Ok(EncodeItem::Audio(packet)) => {
+                    packet.write_interleaved(&mut octx)?;
+                }
+                Ok(EncodeItem::Eof) => break,
+                Ok(EncodeItem::Error(msg)) => bail!("{msg}"),
+                Err(_) => bail!("GPU worker thread ended unexpectedly"),
+            }
+        }
+        encoder.send_eof()?;
+        drain_encoder(&mut encoder, &mut octx, video_ost_index, ost_time_base)?;
+        octx.write_trailer()?;
+        Ok(frame_idx)
+    });
+
+    // GPU stage: this (calling) thread. Scale to RGB24, run the GPU DCT,
+    // reassemble, scale to the encoder's pixel format, tag the PTS — stays
+    // here (rather than moving to a spawned thread) specifically because
+    // `to_rgb`/`from_rgb`/`gpu` can't cross a thread boundary.
     let mut frame_idx: i64 = 0;
-    loop {
-        match work_rx.recv() {
-            Ok(WorkItem::Video(decoded)) => {
-                let mut rgb = VideoFrame::empty();
-                to_rgb.run(&decoded, &mut rgb)?;
+    let gpu_result = (|| -> Result<()> {
+        loop {
+            match work_rx.recv() {
+                Ok(WorkItem::Video(decoded)) => {
+                    let mut rgb = VideoFrame::empty();
+                    to_rgb.run(&decoded, &mut rgb)?;
 
-                let (r, g, b) = split_rgb_planes(&rgb, width, height);
-                let (r2, g2, b2) = gpu.process_rgb(&r, &g, &b, width, height, cutoff)?;
-                let rgb_out = join_rgb_planes(width, height, &r2, &g2, &b2);
+                    let (r, g, b) = split_rgb_planes(&rgb, width, height);
+                    let (r2, g2, b2) = gpu.process_rgb(&r, &g, &b, width, height, cutoff)?;
+                    let rgb_out = join_rgb_planes(width, height, &r2, &g2, &b2);
 
-                let mut yuv = VideoFrame::empty();
-                from_rgb.run(&rgb_out, &mut yuv)?;
-                // Keep the decoded frame's own timeline (rescaled into the
-                // encoder's time base) instead of a synthetic zero-based
-                // counter, so video stays aligned with the audio
-                // passthrough's original timestamps (e.g. inputs with a
-                // nonzero stream start_time). `frame_idx` is only a
-                // fallback for frames with no pts, and is already expressed
-                // directly in enc_time_base units (1 tick = 1 frame), so
-                // unlike a real pts it must NOT be rescaled from the
-                // input's time_base.
-                let source_pts = match decoded.pts() {
-                    Some(pts) => pts.rescale(time_base, enc_time_base),
-                    None => frame_idx,
-                };
-                yuv.set_pts(Some(source_pts));
-                frame_idx += 1;
+                    let mut yuv = VideoFrame::empty();
+                    from_rgb.run(&rgb_out, &mut yuv)?;
+                    // Keep the decoded frame's own timeline (rescaled into
+                    // the encoder's time base) instead of a synthetic
+                    // zero-based counter, so video stays aligned with the
+                    // audio passthrough's original timestamps (e.g. inputs
+                    // with a nonzero stream start_time). `frame_idx` is
+                    // only a fallback for frames with no pts, and is
+                    // already expressed directly in enc_time_base units (1
+                    // tick = 1 frame), so unlike a real pts it must NOT be
+                    // rescaled from the input's time_base.
+                    let source_pts = match decoded.pts() {
+                        Some(pts) => pts.rescale(time_base, enc_time_base),
+                        None => frame_idx,
+                    };
+                    yuv.set_pts(Some(source_pts));
+                    frame_idx += 1;
 
-                encoder.send_frame(&yuv)?;
-                drain_encoder(&mut encoder, &mut octx, video_ost_index, ost_time_base)?;
+                    let _ = tx.send(PipelineMsg::Progress { current: frame_idx as u64, total: total_frames });
 
-                let _ = tx.send(PipelineMsg::Progress { current: frame_idx as u64, total: total_frames });
+                    if encode_tx.send(EncodeItem::Video(yuv)).is_err() {
+                        return Ok(()); // encode stage already stopped (errored)
+                    }
+                }
+                Ok(WorkItem::Audio(packet)) => {
+                    if encode_tx.send(EncodeItem::Audio(packet)).is_err() {
+                        return Ok(());
+                    }
+                }
+                Ok(WorkItem::Eof) => return Ok(()),
+                Ok(WorkItem::Error(msg)) => bail!("{msg}"),
+                Err(_) => bail!("decode worker thread ended unexpectedly"),
             }
-            Ok(WorkItem::Audio(packet)) => {
-                packet.write_interleaved(&mut octx)?;
-            }
-            Ok(WorkItem::Eof) => break,
-            Ok(WorkItem::Error(msg)) => bail!("{msg}"),
-            Err(_) => bail!("decode worker thread ended unexpectedly"),
+        }
+    })();
+
+    match &gpu_result {
+        Ok(()) => {
+            let _ = encode_tx.send(EncodeItem::Eof);
+        }
+        Err(e) => {
+            let _ = encode_tx.send(EncodeItem::Error(format!("{e:#}")));
         }
     }
 
+    // Reaching here means `encode_stage` finished cleanly (it only ever
+    // receives `EncodeItem::Eof`, never `Error`, when `gpu_result` is
+    // `Ok`), so `gpu_result` is already known-`Ok` — nothing left to check.
+    let final_frame_count = match encode_stage.join() {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => bail!("encode worker thread panicked"),
+    };
     match producer.join() {
         Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(e),
         Err(_) => bail!("decode worker thread panicked"),
     }
 
-    encoder.send_eof()?;
-    drain_encoder(&mut encoder, &mut octx, video_ost_index, ost_time_base)?;
-    octx.write_trailer()?;
-
-    info!(frames = frame_idx, path = %output_path.display(), "encode complete");
+    info!(frames = final_frame_count, path = %output_path.display(), "encode complete");
     let _ = tx.send(PipelineMsg::Log(format!(
         "wrote {} frames to {}",
-        frame_idx,
+        final_frame_count,
         output_path.display()
     )));
     let _ = tx.send(PipelineMsg::Done);
