@@ -90,16 +90,25 @@ Builds fine against musl — no special target needed.
 
 ### NixOS
 
+A `flake.nix` is included — verified in a container:
+
+```bash
+nix develop --command bash -c 'rustup default stable && cargo build --release'
+```
+
+Or without flakes:
+
 ```bash
 nix-shell -p rustup gcc pkg-config \
   gst_all_1.gstreamer gst_all_1.gst-plugins-base gst_all_1.gst-plugins-good \
   gst_all_1.gst-plugins-bad gst_all_1.gst-plugins-ugly gst_all_1.gst-libav \
-  gst_all_1.gst-vaapi \
   --run 'rustup default stable && cargo build --release'
 ```
 
 nixpkgs' own `rustc` package can lag behind what this crate's dependencies
-need — `rustup` inside the shell sidesteps that.
+need — `rustup` inside the shell sidesteps that. VAAPI (the `va` plugin,
+`vah264enc`/etc.) now lives in `gst-plugins-bad` since GStreamer 1.28 —
+the older separate `gst-vaapi` package was removed upstream.
 
 ### Windows
 
