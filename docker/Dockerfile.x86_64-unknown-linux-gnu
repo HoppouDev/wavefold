@@ -1,0 +1,9 @@
+# Native arch for this image (Ubuntu 24.04) - no multiarch dance needed,
+# unlike Dockerfile.aarch64-unknown-linux-gnu / .riscv64gc-unknown-linux-gnu.
+FROM ghcr.io/cross-rs/x86_64-unknown-linux-gnu:main
+
+RUN apt-get update && \
+    apt-get install --assume-yes --no-install-recommends \
+      libgstreamer1.0-dev \
+      libgstreamer-plugins-base1.0-dev && \
+    rm -rf /var/lib/apt/lists/*
