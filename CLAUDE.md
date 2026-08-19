@@ -4,29 +4,40 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`dctenc` — a native Rust/iced desktop app that applies a whole-frame GPU DCT
-"distortion" effect to video: decode → per-frame DCT compress/reconstruct on
-the GPU → re-encode with a user-selectable encoder — software (libx264/
-libx265/libvpx-vp9/libaom-av1) or VAAPI hardware — with audio passed through
-untouched. This is a visual effect tool, not a real codec — the point is the
-ringing/ghosting artifact the DCT cutoff produces, not compression
-efficiency.
+`dctenc` — a native Rust/iced desktop app (plus a headless `dctenc-cli`
+binary) that applies a whole-frame DCT "distortion" effect to video: decode
+→ per-frame DCT compress/reconstruct on a user-selectable compute backend
+(GPU via wgpu, or a pure-CPU fallback) → re-encode with a user-selectable
+encoder — software (libx264/libx265/libvpx-vp9/libaom-av1) or VAAPI hardware
+— with audio passed through untouched. This is a visual effect tool, not a
+real codec — the point is the ringing/ghosting artifact the DCT cutoff
+produces, not compression efficiency.
 
 ## Commands
 
 ```bash
-cargo build --release        # release build (dev build works too, just slower at runtime)
-cargo run --release          # launch the iced GUI
-cargo check                  # fast typecheck, iterate with this first
-cargo test --release         # unit tests (gpu.rs, pipeline.rs) + tests/integration.rs
-cargo test --release <name>  # run a single test by substring, e.g. `cargo test --release roundtrip`
+cargo build --release                            # release build: GUI (dctenc) + CLI (dctenc-cli) binaries
+cargo run --release                               # launch the iced GUI
+cargo run --release --bin dctenc-cli -- <in> <out> [--cutoff F] [--encoder ...] [--backend gpu|cpu]
+cargo check                                       # fast typecheck, iterate with this first
+cargo test --release                              # unit tests (gpu.rs, cpu.rs, dct_math.rs, pipeline.rs) + tests/integration.rs
+cargo test --release <name>                       # run a single test by substring, e.g. `cargo test --release roundtrip`
 ```
 
-GPU tests (in `src/gpu.rs`) require a real wgpu adapter and skip gracefully
-(printing to stderr, not failing) if `DctGpu::new()` can't find one — expect
-skips in a headless/adapterless sandbox. `tests/integration.rs` shells out to
-the `ffmpeg` CLI (not `ffmpeg-next`) purely to generate synthetic test-fixture
+GPU tests (in `src/gpu.rs`, plus the cross-check test in `src/cpu.rs`)
+require a real wgpu adapter and skip gracefully (printing to stderr, not
+failing) if `DctGpu::new()` can't find one — expect skips in a
+headless/adapterless sandbox. CPU-backend tests (`src/cpu.rs`) have no such
+guard and always run — this is deliberate, since it's the proof the CPU
+backend needs no GPU at all. `tests/integration.rs` shells out to the
+`ffmpeg` CLI (not `ffmpeg-next`) purely to generate synthetic test-fixture
 clips; it also skips gracefully if `ffmpeg` isn't on `PATH`.
+
+`.github/workflows/ci.yml` runs `dctenc-cli --backend cpu` inside an
+Arch Linux container on a standard (GPU-less) `ubuntu-latest` runner — see
+the workflow file's comments for why Arch specifically (this repo's pinned
+`ffmpeg-next` major version needs to match the installed FFmpeg's, and
+Ubuntu's packaged FFmpeg is far behind what's pinned here).
 
 `RUST_LOG=debug cargo run --release` (or any `tracing`-compatible env filter)
 surfaces the `tracing` diagnostics described below — the app has no other
@@ -57,17 +68,54 @@ pipeline error, not a build failure.
 
 ## Architecture
 
-Pipeline, one direction: `main.rs` (iced bootstrap) → `ui/` (setup/encoding
-pages) → `pipeline.rs` (decode/encode orchestration via ffmpeg-next, using
-`encoders.rs` for the chosen output codec) → `gpu.rs` (wgpu compute) →
-`shader.wgsl`.
+Pipeline, one direction: `main.rs` (iced bootstrap) or `bin/dctenc-cli.rs`
+(headless clap CLI) → `ui/` (setup/encoding pages, GUI only) →
+`pipeline.rs` (decode/encode orchestration via ffmpeg-next, using
+`encoders.rs` for the chosen output codec) → `dct_backend.rs`'s
+`ComputeBackend` (GPU or CPU) → `gpu.rs` (wgpu compute) / `cpu.rs` (plain
+Rust + rayon), both driven by the same basis math in `dct_math.rs` → (GPU
+only) `shader.wgsl`.
 
-- **`src/lib.rs`** re-exports `pub mod encoders; pub mod gpu; pub mod
-  pipeline;` so the binary (`main.rs`/`ui/`) and `tests/integration.rs` both
-  link against the same public API — this split exists specifically so the
-  pipeline can be integration-tested without a GUI. `ui/` and `main.rs` are
-  binary-only (not part of the library) since they're not exercised by
-  `tests/integration.rs`.
+- **`src/lib.rs`** re-exports `pub mod cpu; pub mod dct_backend; mod
+  dct_math; pub mod encoders; pub mod gpu; pub mod pipeline;` so both binary
+  targets (`main.rs`/`ui/` for the GUI, `bin/dctenc-cli.rs` for the CLI) and
+  `tests/integration.rs` link against the same public API — this split
+  exists specifically so the pipeline can be exercised without a GUI.
+  `dct_math` is deliberately *not* `pub` — it's `pub(crate)` plumbing shared
+  only between `gpu.rs` and `cpu.rs`, not part of the crate's public
+  surface. `ui/` and `main.rs` are binary-only (not part of the library)
+  since they're not exercised by `tests/integration.rs`.
+
+- **`src/bin/dctenc-cli.rs`** — headless entry point, auto-discovered by
+  Cargo as a second binary target (no `[[bin]]` needed in `Cargo.toml`) from
+  anything under `src/bin/*.rs`. A `clap::Parser` struct (`input`, `output`,
+  `--cutoff`, `--encoder`, `--backend`) parses args, spawns `pipeline::run`
+  on a `std::thread` exactly like `ui/encoding.rs` does (it's a blocking
+  call, not async), then drives the `tokio::sync::mpsc` receiver on the main
+  thread with `rx.blocking_recv()` — this works fine with no tokio runtime
+  present, which is exactly what `blocking_recv` is for; the CLI has no
+  other use for tokio. Exits `1` on `PipelineMsg::Error`. This is the
+  binary `.github/workflows/ci.yml` runs with `--backend cpu` on a GPU-less
+  runner.
+
+- **`src/dct_backend.rs`** — `DctBackend` (the trait `gpu.rs`'s `DctGpu` and
+  `cpu.rs`'s `DctCpu` both implement: one `process_rgb(r, g, b, width,
+  height, cutoff)` method) and `ComputeBackend` (the user-facing `Gpu`/`Cpu`
+  choice — same enum+`ALL`+`Display`+resolver shape as `EncoderChoice` in
+  `encoders.rs`, and for the same reason: one switchable choice the GUI
+  pick_list and the CLI's `--backend` flag both need). `ComputeBackend::
+  build()` is the single place that turns the choice into a live
+  `Box<dyn DctBackend>` (`DctGpu::new()`, which can fail with no compatible
+  adapter, vs. `DctCpu::new()`, which can't fail). Also derives
+  `clap::ValueEnum` (as does `EncoderChoice`) so the CLI's `--backend`/
+  `--encoder` flags share one source of truth with the GUI's pick_lists
+  instead of a separate hand-maintained CLI-side enum.
+
+- **`src/dct_math.rs`** — `dct_basis`/`transpose_square`, the pure-CPU
+  matrix-generation math shared verbatim by both `gpu.rs` (uploads the
+  result to GPU buffers) and `cpu.rs` (uses it directly as the transform
+  matrices) — pulled out specifically so the two compute backends can never
+  silently drift onto different basis matrices.
 
 - **`src/main.rs`** — a 9-line bootstrap: `mod ui;` plus
   `iced::application(ui::App::default, ui::App::update, ui::App::view)`.
@@ -90,10 +138,13 @@ pages) → `pipeline.rs` (decode/encode orchestration via ffmpeg-next, using
   - **`ui/setup.rs`** — input/output file pickers (`rfd::AsyncFileDialog`
     via `Task::perform`, not the old synchronous `rfd::FileDialog`), the
     cutoff slider, the encoder `pick_list` (`EncoderChoice` implements
-    `Display` in `encoders.rs` specifically for this), and the Encode
-    button (`on_press_maybe`, only enabled once both paths are set).
-  - **`ui/encoding.rs`** — `State::start(input, output, cutoff, encoder)`
-    spawns `pipeline::run` on a plain `std::thread` (it's a blocking call,
+    `Display` in `encoders.rs` specifically for this), a second `pick_list`
+    for `ComputeBackend` (same `Display`-via-`label()` pattern, in
+    `dct_backend.rs`), and the Encode button (`on_press_maybe`, only enabled
+    once both paths are set).
+  - **`ui/encoding.rs`** — `State::start(input, output, cutoff, encoder,
+    backend)` spawns `pipeline::run` on a plain `std::thread` (it's a
+    blocking call,
     not async — spawning it as a tokio task would tie up an executor
     thread for the whole encode) and returns a `Task` that streams its
     `tokio::sync::mpsc` progress channel back via `Task::run(
@@ -210,6 +261,13 @@ pages) → `pipeline.rs` (decode/encode orchestration via ffmpeg-next, using
     fmt::init()`, so a `tracing` call there would silently vanish instead
     of printing.
 
+- **`src/pipeline.rs`**'s `run`/`run_inner` take a `backend: ComputeBackend`
+  parameter (alongside `encoder_choice`); `run_inner` resolves it once via
+  `backend.build()?` into a `Box<dyn DctBackend>` before the pipeline
+  starts, and the GPU-stage loop calls `.process_rgb(...)` on that trait
+  object — the loop body doesn't know or care which concrete backend it's
+  driving.
+
 - **`src/gpu.rs`** — `DctGpu`: the whole-frame (not block-based) separable
   2D DCT. Per plane, 4 GPU dispatches ping-pong two buffers: forward row →
   forward col (+ cutoff mask) → inverse col → inverse row (+ clamp to pixel
@@ -246,6 +304,23 @@ pages) → `pipeline.rs` (decode/encode orchestration via ffmpeg-next, using
     frame — `pipeline.rs` logs a warning above 640×480 because this gets
     slow fast at real video resolutions. Don't "simplify" this without
     accounting for that cost.
+
+- **`src/cpu.rs`** — `DctCpu`: a direct transcription of `shader.wgsl`'s
+  `row_pass`/`col_pass` into plain Rust, run on the CPU instead of the GPU —
+  same four passes (forward row → forward col + cutoff mask → inverse col →
+  inverse row + clamp), same basis matrices (from `dct_math.rs`, so it can't
+  silently drift from the GPU path), same mask formula (`x/(w-1) + y/(h-1)
+  <= threshold`). Exists purely so the effect can run with no GPU/wgpu
+  adapter present — e.g. `.github/workflows/ci.yml`'s runner. Each pass
+  parallelizes over independent output rows with `rayon::par_chunks_mut`
+  (same technique as `pipeline.rs`'s `split_rgb_planes`/`join_rgb_planes`),
+  so it's GPU-less but not single-threaded. Caches the basis matrices in a
+  `RefCell<Option<Basis>>` keyed on `(width, height)`, mirroring `DctGpu`'s
+  `PlaneBuffers` cache shape minus the GPU-specific bind-group machinery.
+  `src/cpu.rs`'s test module includes `cpu_and_gpu_backends_agree`
+  (GPU-guarded like `gpu.rs`'s tests) as a correctness cross-check between
+  the two implementations — everything else in that module runs
+  unconditionally, with no adapter guard, since that's the whole point.
 
 - **`src/shader.wgsl`** — the two WGSL compute entry points (`row_pass`,
   `col_pass`) that back the passes above. No shared/workgroup memory is

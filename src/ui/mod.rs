@@ -30,8 +30,8 @@ impl App {
             (Screen::Setup(state), Message::Setup(msg)) => match state.update(msg) {
                 setup::Action::None => Task::none(),
                 setup::Action::Run(task) => task.map(Message::Setup),
-                setup::Action::Start { input, output, cutoff, encoder } => {
-                    let (encoding_state, task) = encoding::State::start(input, output, cutoff, encoder);
+                setup::Action::Start { input, output, cutoff, encoder, backend } => {
+                    let (encoding_state, task) = encoding::State::start(input, output, cutoff, encoder, backend);
                     self.screen = Screen::Encoding(encoding_state);
                     task.map(Message::Encoding)
                 }

@@ -29,7 +29,7 @@ pub struct EncoderProfile {
 }
 
 /// User-selectable output video encoder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum EncoderChoice {
     H264,
     H265,

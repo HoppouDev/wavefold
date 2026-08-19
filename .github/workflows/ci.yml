@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    # Standard GitHub-hosted runners have no GPU/wgpu adapter and no VAAPI
+    # device — this job is the proof the CLI's --backend cpu path works
+    # without either. It runs inside an Arch Linux container rather than
+    # directly on the Ubuntu host because this repo pins `ffmpeg-next = "9"`
+    # (see CLAUDE.md: "the crate's major version must match the installed
+    # FFmpeg's major version"), and Ubuntu's own packaged FFmpeg is much
+    # older than 9 — Arch's rolling-release `ffmpeg` package tracks current
+    # upstream FFmpeg, matching what this repo needs without fighting stale
+    # PPAs or building FFmpeg from source in CI.
+    container: archlinux:latest
+    steps:
+      - name: Install toolchain and FFmpeg 9 dev headers
+        run: pacman -Syu --noconfirm --needed git rust ffmpeg pkgconf clang base-devel
+
+      - uses: actions/checkout@v4
+
+      - name: Build (GUI + CLI binaries)
+        run: cargo build --release
+
+      - name: Run library/unit tests (CPU-backend tests need no GPU)
+        run: cargo test --release --lib
+
+      - name: Generate a short synthetic test clip
+        run: |
+          ffmpeg -v error -f lavfi -i testsrc=size=160x120:duration=1:rate=8 \
+            -pix_fmt yuv420p -y sample.mp4
+
+      - name: Encode with the CLI (CPU DCT backend, software encoder)
+        run: |
+          cargo run --release --bin dctenc-cli -- \
+            sample.mp4 out.mp4 --backend cpu --encoder h264
+
+      - name: Verify output was produced
+        run: test -s out.mp4

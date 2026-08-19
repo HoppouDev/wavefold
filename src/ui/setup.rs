@@ -1,3 +1,4 @@
+use dctenc::dct_backend::ComputeBackend;
 use dctenc::encoders::EncoderChoice;
 use iced::widget::{button, column, pick_list, row, slider, text};
 use iced::{Element, Task};
@@ -8,11 +9,12 @@ pub struct State {
     output: Option<PathBuf>,
     cutoff: f32,
     encoder: EncoderChoice,
+    backend: ComputeBackend,
 }
 
 impl Default for State {
     fn default() -> Self {
-        Self { input: None, output: None, cutoff: 0.6, encoder: EncoderChoice::H264 }
+        Self { input: None, output: None, cutoff: 0.6, encoder: EncoderChoice::H264, backend: ComputeBackend::Gpu }
     }
 }
 
@@ -24,6 +26,7 @@ pub enum Message {
     OutputPicked(Option<PathBuf>),
     CutoffChanged(f32),
     EncoderSelected(EncoderChoice),
+    BackendSelected(ComputeBackend),
     Start,
 }
 
@@ -34,7 +37,7 @@ pub enum Message {
 pub enum Action {
     None,
     Run(Task<Message>),
-    Start { input: PathBuf, output: PathBuf, cutoff: f32, encoder: EncoderChoice },
+    Start { input: PathBuf, output: PathBuf, cutoff: f32, encoder: EncoderChoice, backend: ComputeBackend },
 }
 
 impl State {
@@ -62,11 +65,15 @@ impl State {
                 self.encoder = encoder;
                 Action::None
             }
+            Message::BackendSelected(backend) => {
+                self.backend = backend;
+                Action::None
+            }
             Message::Start => {
                 let (Some(input), Some(output)) = (self.input.clone(), self.output.clone()) else {
                     return Action::None;
                 };
-                Action::Start { input, output, cutoff: self.cutoff, encoder: self.encoder }
+                Action::Start { input, output, cutoff: self.cutoff, encoder: self.encoder, backend: self.backend }
             }
         }
     }
@@ -97,6 +104,12 @@ impl State {
         ]
         .spacing(10);
 
+        let backend_row = row![
+            text("Compute backend:"),
+            pick_list(ComputeBackend::ALL, Some(self.backend), Message::BackendSelected),
+        ]
+        .spacing(10);
+
         let can_start = self.input.is_some() && self.output.is_some();
         let start_button = button("Encode").on_press_maybe(can_start.then_some(Message::Start));
 
@@ -107,6 +120,7 @@ impl State {
             output_row,
             cutoff_row,
             encoder_row,
+            backend_row,
             start_button,
         ]
         .spacing(12)

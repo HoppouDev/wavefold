@@ -1,3 +1,4 @@
+use dctenc::dct_backend::ComputeBackend;
 use dctenc::pipeline::{self, PipelineMsg};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -73,7 +74,7 @@ fn encodes_synthetic_clip_end_to_end() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let input2 = input.clone();
     let output2 = output.clone();
-    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, dctenc::encoders::EncoderChoice::H264, tx));
+    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, dctenc::encoders::EncoderChoice::H264, ComputeBackend::Gpu, tx));
 
     let mut saw_done = false;
     let mut saw_error = None;
@@ -104,6 +105,52 @@ fn encodes_synthetic_clip_end_to_end() {
     let _ = std::fs::remove_file(&output);
 }
 
+/// Full pipeline with the CPU DCT backend: no GPU adapter check at all —
+/// this is the end-to-end proof the pipeline can run on a GPU-less machine
+/// (e.g. a standard GitHub Actions runner).
+#[test]
+fn encodes_synthetic_clip_with_cpu_backend() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+
+    let input = make_test_clip(48, 32, 8, 1); // 8 frames
+    let output = unique_path("out_cpu_backend.mp4");
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let input2 = input.clone();
+    let output2 = output.clone();
+    let handle = std::thread::spawn(move || {
+        pipeline::run(&input2, &output2, 0.4, dctenc::encoders::EncoderChoice::H264, ComputeBackend::Cpu, tx)
+    });
+
+    let mut saw_done = false;
+    let mut saw_error = None;
+    while let Some(msg) = rx.blocking_recv() {
+        match msg {
+            PipelineMsg::Error(e) => saw_error = Some(e),
+            PipelineMsg::Done => saw_done = true,
+            _ => {}
+        }
+    }
+    handle.join().unwrap();
+
+    if let Some(e) = saw_error {
+        panic!("pipeline reported an error: {e}");
+    }
+    assert!(saw_done, "pipeline never sent Done");
+    assert!(output.exists(), "output file was not created");
+
+    let (w, h, frames) = probe_dims_and_frames(&output);
+    assert_eq!(w, 48);
+    assert_eq!(h, 32);
+    assert_eq!(frames, 8);
+
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&output);
+}
+
 #[test]
 fn reports_error_for_nonexistent_input() {
     if !ffmpeg_available() {
@@ -114,7 +161,7 @@ fn reports_error_for_nonexistent_input() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let out2 = output.clone();
     let handle = std::thread::spawn(move || {
-        pipeline::run(std::path::Path::new("/nonexistent/dctenc_missing_input.mp4"), &out2, 0.32, dctenc::encoders::EncoderChoice::H264, tx)
+        pipeline::run(std::path::Path::new("/nonexistent/dctenc_missing_input.mp4"), &out2, 0.32, dctenc::encoders::EncoderChoice::H264, ComputeBackend::Gpu, tx)
     });
 
     let mut saw_error = false;
@@ -155,7 +202,7 @@ fn encodes_synthetic_clip_with_audio_end_to_end() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let input2 = input.clone();
     let output2 = output.clone();
-    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, dctenc::encoders::EncoderChoice::H264, tx));
+    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, dctenc::encoders::EncoderChoice::H264, ComputeBackend::Gpu, tx));
 
     let mut saw_done = false;
     let mut saw_error = None;
@@ -209,7 +256,7 @@ fn encodes_with_every_selectable_encoder() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let input2 = input.clone();
         let output2 = output.clone();
-        let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.5, choice, tx));
+        let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.5, choice, ComputeBackend::Gpu, tx));
 
         let mut saw_done = false;
         let mut saw_error = None;
@@ -298,7 +345,7 @@ fn encodes_clip_with_unspecified_channel_layout_audio() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let input2 = input.clone();
     let output2 = output.clone();
-    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, dctenc::encoders::EncoderChoice::H264, tx));
+    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, dctenc::encoders::EncoderChoice::H264, ComputeBackend::Gpu, tx));
 
     let mut saw_done = false;
     let mut saw_error = None;
@@ -370,7 +417,7 @@ fn estimates_total_frames_from_format_duration_when_stream_metadata_missing() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let input2 = input.clone();
     let output2 = output.clone();
-    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, dctenc::encoders::EncoderChoice::H264, tx));
+    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, dctenc::encoders::EncoderChoice::H264, ComputeBackend::Gpu, tx));
 
     let mut saw_done = false;
     let mut saw_error = None;

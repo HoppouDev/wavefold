@@ -1,3 +1,4 @@
+use dctenc::dct_backend::ComputeBackend;
 use dctenc::encoders::EncoderChoice;
 use dctenc::pipeline::{self, PipelineMsg};
 use iced::widget::{button, column, progress_bar, scrollable, text};
@@ -28,11 +29,11 @@ impl State {
     /// Kicks off `pipeline::run` on a dedicated OS thread (it's a blocking
     /// call, not async) and returns a `Task` that streams its progress
     /// channel back reactively instead of the page polling every frame.
-    pub fn start(input: PathBuf, output: PathBuf, cutoff: f32, encoder: EncoderChoice) -> (Self, Task<Message>) {
+    pub fn start(input: PathBuf, output: PathBuf, cutoff: f32, encoder: EncoderChoice, backend: ComputeBackend) -> (Self, Task<Message>) {
         let state = Self { progress_current: 0, progress_total: 0, log: Vec::new(), running: true };
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        std::thread::spawn(move || pipeline::run(&input, &output, cutoff, encoder, tx));
+        std::thread::spawn(move || pipeline::run(&input, &output, cutoff, encoder, backend, tx));
 
         let task = Task::run(UnboundedReceiverStream::new(rx), Message::Pipeline).chain(Task::done(Message::WorkerDone));
         (state, task)

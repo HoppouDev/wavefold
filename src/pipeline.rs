@@ -1,5 +1,5 @@
+use crate::dct_backend::ComputeBackend;
 use crate::encoders::{EncoderChoice, HwAccel};
-use crate::gpu::DctGpu;
 use anyhow::{anyhow, bail, Context, Result};
 use ffmpeg_next as ff;
 use ff::format::Pixel;
@@ -132,8 +132,15 @@ fn encode_hw_frame(hw_frames_ctx: &HwFramesContext, sw_frame: &VideoFrame) -> Re
     Ok(hw_frame)
 }
 
-pub fn run(input: &Path, output: &Path, cutoff: f32, encoder_choice: EncoderChoice, tx: Sender<PipelineMsg>) {
-    if let Err(e) = run_inner(input, output, cutoff, encoder_choice, &tx) {
+pub fn run(
+    input: &Path,
+    output: &Path,
+    cutoff: f32,
+    encoder_choice: EncoderChoice,
+    backend: ComputeBackend,
+    tx: Sender<PipelineMsg>,
+) {
+    if let Err(e) = run_inner(input, output, cutoff, encoder_choice, backend, &tx) {
         error!("pipeline failed: {e:#}");
         let _ = tx.send(PipelineMsg::Error(format!("{e:#}")));
     }
@@ -221,6 +228,7 @@ fn run_inner(
     output_path: &Path,
     cutoff: f32,
     encoder_choice: EncoderChoice,
+    backend: ComputeBackend,
     tx: &Sender<PipelineMsg>,
 ) -> Result<()> {
     ff::init()?;
@@ -304,9 +312,9 @@ fn run_inner(
         debug!("no audio stream found");
         let _ = tx.send(PipelineMsg::Log("no audio stream found".into()));
     }
-    info!("initializing GPU DCT pipeline");
-    let _ = tx.send(PipelineMsg::Log("initializing GPU DCT pipeline...".into()));
-    let gpu = DctGpu::new().map_err(|e| anyhow!("GPU init failed: {e:#}"))?;
+    info!(?backend, "initializing DCT compute backend");
+    let _ = tx.send(PipelineMsg::Log(format!("initializing {backend} DCT backend...")));
+    let dct = backend.build()?;
 
     let mut to_rgb = Scaler::get(
         decoder.format(),
@@ -560,7 +568,7 @@ fn run_inner(
                     to_rgb.run(&decoded, &mut rgb)?;
 
                     let (r, g, b) = split_rgb_planes(&rgb, width, height);
-                    let (r2, g2, b2) = gpu.process_rgb(&r, &g, &b, width, height, cutoff)?;
+                    let (r2, g2, b2) = dct.process_rgb(&r, &g, &b, width, height, cutoff)?;
                     let rgb_out = join_rgb_planes(width, height, &r2, &g2, &b2);
 
                     let mut yuv = VideoFrame::empty();
