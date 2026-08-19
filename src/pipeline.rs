@@ -1,4 +1,4 @@
-use crate::encoders::EncoderChoice;
+use crate::encoders::{EncoderChoice, HwAccel};
 use crate::gpu::DctGpu;
 use anyhow::{anyhow, bail, Context, Result};
 use ffmpeg_next as ff;
@@ -38,6 +38,98 @@ enum EncodeItem {
     Audio(ff::Packet),
     Eof,
     Error(String),
+}
+
+/// Owns the VAAPI hw-frames-context buffer ref for the lifetime of the
+/// encode: per-frame `av_hwframe_get_buffer` calls (in `encode_hw_frame`)
+/// need it kept alive alongside the encoder itself, which is why this is
+/// held by the encode+mux stage rather than dropped right after setup.
+///
+/// SAFETY: `*mut AVBufferRef` is a plain heap-allocated refcounted handle
+/// with no thread-affinity of its own; moving ownership into the
+/// encode-stage thread (this type is only ever used from that one thread
+/// after construction, never shared/aliased across threads) is sound the
+/// same way `ffmpeg-next` itself asserts `Send` for `codec::context::
+/// Context`'s raw `AVCodecContext` pointer.
+struct HwFramesContext(*mut ff::sys::AVBufferRef);
+
+unsafe impl Send for HwFramesContext {}
+
+impl Drop for HwFramesContext {
+    fn drop(&mut self) {
+        unsafe { ff::sys::av_buffer_unref(&mut self.0) }
+    }
+}
+
+/// Creates a VAAPI hw device + hw frames context sized for `width`x`height`
+/// software frames in `sw_format`, and attaches it to `enc_ctx.hw_frames_ctx`
+/// — must run before the encoder is opened (`avcodec_open2` reads
+/// `hw_frames_ctx` during init for hardware encoders). Sequence follows
+/// FFmpeg's own `doc/examples/vaapi_encode.c`. `device` is left `NULL` in
+/// `av_hwdevice_ctx_create` so libva auto-selects the render node, rather
+/// than hardcoding e.g. `/dev/dri/renderD128`.
+fn setup_hw_frames_context(
+    enc_ctx: &mut ff::codec::encoder::video::Video,
+    hw: &HwAccel,
+    width: u32,
+    height: u32,
+    sw_format: Pixel,
+) -> Result<HwFramesContext> {
+    unsafe {
+        let mut hw_device_ctx: *mut ff::sys::AVBufferRef = std::ptr::null_mut();
+        let ret = ff::sys::av_hwdevice_ctx_create(
+            &mut hw_device_ctx,
+            hw.device_type,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            0,
+        );
+        if ret < 0 {
+            bail!("failed to create hw device context (no compatible GPU/driver available?): ffmpeg error {ret}");
+        }
+
+        let hw_frames_ref = ff::sys::av_hwframe_ctx_alloc(hw_device_ctx);
+        ff::sys::av_buffer_unref(&mut hw_device_ctx); // hw_frames_ref holds its own ref to the device now
+        if hw_frames_ref.is_null() {
+            bail!("failed to allocate hw frames context");
+        }
+
+        let frames_ctx = (*hw_frames_ref).data as *mut ff::sys::AVHWFramesContext;
+        (*frames_ctx).format = hw.encoder_pixel_format.into();
+        (*frames_ctx).sw_format = sw_format.into();
+        (*frames_ctx).width = width as i32;
+        (*frames_ctx).height = height as i32;
+        (*frames_ctx).initial_pool_size = 4;
+
+        let ret = ff::sys::av_hwframe_ctx_init(hw_frames_ref);
+        if ret < 0 {
+            let mut owned = hw_frames_ref;
+            ff::sys::av_buffer_unref(&mut owned);
+            bail!("failed to initialize hw frames context: ffmpeg error {ret}");
+        }
+
+        (*enc_ctx.as_mut_ptr()).hw_frames_ctx = ff::sys::av_buffer_ref(hw_frames_ref);
+
+        Ok(HwFramesContext(hw_frames_ref))
+    }
+}
+
+/// Uploads a software frame into a hw frame via the given context, copying
+/// over the PTS, ready to hand to `encoder.send_frame`.
+fn encode_hw_frame(hw_frames_ctx: &HwFramesContext, sw_frame: &VideoFrame) -> Result<VideoFrame> {
+    let mut hw_frame = VideoFrame::empty();
+    unsafe {
+        let ret = ff::sys::av_hwframe_get_buffer(hw_frames_ctx.0, hw_frame.as_mut_ptr(), 0);
+        if ret < 0 {
+            bail!("av_hwframe_get_buffer failed: ffmpeg error {ret}");
+        }
+        let ret = ff::sys::av_hwframe_transfer_data(hw_frame.as_mut_ptr(), sw_frame.as_ptr(), 0);
+        if ret < 0 {
+            bail!("av_hwframe_transfer_data failed: ffmpeg error {ret}");
+        }
+        (*hw_frame.as_mut_ptr()).pts = (*sw_frame.as_ptr()).pts;
+    }
+    Ok(hw_frame)
 }
 
 pub fn run(input: &Path, output: &Path, cutoff: f32, encoder_choice: EncoderChoice, tx: Sender<PipelineMsg>) {
@@ -224,7 +316,7 @@ fn run_inner(
     let mut enc_ctx = ff::codec::context::Context::new_with_codec(codec).encoder().video()?;
     enc_ctx.set_width(width);
     enc_ctx.set_height(height);
-    enc_ctx.set_format(profile.pixel_format);
+    enc_ctx.set_format(profile.hardware.as_ref().map_or(profile.sw_pixel_format, |hw| hw.encoder_pixel_format));
     enc_ctx.set_time_base(enc_time_base);
     enc_ctx.set_frame_rate(Some(frame_rate));
     // No B-frames, applied uniformly regardless of which encoder was picked:
@@ -238,6 +330,16 @@ fn run_inner(
     if octx.format().flags().contains(ff::format::Flags::GLOBAL_HEADER) {
         enc_ctx.set_flags(ff::codec::Flags::GLOBAL_HEADER);
     }
+
+    // Must happen before `open_as_with` below: `avcodec_open2` reads
+    // `hw_frames_ctx` during hardware-encoder init.
+    let hw_frames_ctx = match &profile.hardware {
+        Some(hw) => {
+            debug!(device_type = ?hw.device_type, "setting up hw frames context");
+            Some(setup_hw_frames_context(&mut enc_ctx, hw, width, height, profile.sw_pixel_format)?)
+        }
+        None => None,
+    };
 
     let mut encoder_opts = ff::Dictionary::new();
     for (key, value) in profile.options {
@@ -292,7 +394,7 @@ fn run_inner(
         Pixel::RGB24,
         width,
         height,
-        profile.pixel_format,
+        profile.sw_pixel_format,
         width,
         height,
         ScaleFlags::BILINEAR,
@@ -396,7 +498,13 @@ fn run_inner(
         loop {
             match encode_rx.recv() {
                 Ok(EncodeItem::Video(yuv)) => {
-                    encoder.send_frame(&yuv)?;
+                    match &hw_frames_ctx {
+                        Some(hw) => {
+                            let hw_frame = encode_hw_frame(hw, &yuv)?;
+                            encoder.send_frame(&hw_frame)?;
+                        }
+                        None => encoder.send_frame(&yuv)?,
+                    }
                     drain_encoder(&mut encoder, &mut octx, video_ost_index, ost_time_base)?;
                     frame_idx += 1;
                 }

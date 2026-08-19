@@ -6,10 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `dctenc` — a native Rust/iced desktop app that applies a whole-frame GPU DCT
 "distortion" effect to video: decode → per-frame DCT compress/reconstruct on
-the GPU → re-encode with a user-selectable encoder (libx264/libx265/
-libvpx-vp9/libaom-av1), with audio passed through untouched. This is a
-visual effect tool, not a real codec — the point is the ringing/ghosting
-artifact the DCT cutoff produces, not compression efficiency.
+the GPU → re-encode with a user-selectable encoder — software (libx264/
+libx265/libvpx-vp9/libaom-av1) or VAAPI hardware — with audio passed through
+untouched. This is a visual effect tool, not a real codec — the point is the
+ringing/ghosting artifact the DCT cutoff produces, not compression
+efficiency.
 
 ## Commands
 
@@ -47,7 +48,12 @@ encoder libraries actually available on the system (libx264/libx265/
 libvpx/libaom — see `src/encoders.rs`) must be installed and discoverable
 for a from-scratch build; an `EncoderChoice` whose libav encoder isn't
 present in the local FFmpeg build fails at encode time with a clear error,
-not at compile time.
+not at compile time. The `*Vaapi` variants additionally need a VAAPI-capable
+GPU/driver (`libva`, a `/dev/dri/renderD*` node) at *runtime* — there's no
+build-time dependency on VAAPI since `pipeline.rs` drives it through raw FFI
+against symbols FFmpeg's headers already provide, not a separate crate;
+`av_hwdevice_ctx_create` failing (no compatible device) surfaces as a normal
+pipeline error, not a build failure.
 
 ## Architecture
 
@@ -98,42 +104,82 @@ pages) → `pipeline.rs` (decode/encode orchestration via ffmpeg-next, using
     (enabled once the worker reports done) that returns `Action::
     BackToSetup`.
 
-- **`src/encoders.rs`** — `EncoderChoice` (H264/H265/Vp9/Av1) and its
-  `profile()` → `EncoderProfile { codec_name, pixel_format, options }`:
+- **`src/encoders.rs`** — `EncoderChoice` (8 variants: H264/H265/Vp9/Av1,
+  each with a `*Vaapi` hardware counterpart) and its `profile()` →
+  `EncoderProfile { codec_name, sw_pixel_format, options, hardware }`:
   the libav encoder name for `ff::encoder::find_by_name` (not a codec-ID
-  lookup — several of these codecs have more than one libav encoder),
-  destination pixel format, and that encoder's own dictionary options.
-  Different encoders take different option keys (`preset` for x264/x265;
-  `deadline`+`cpu-used` for libvpx-vp9; `cpu-used` for libaom-av1) — this
-  isn't a codec-ID swap. `bf=0` (the mp4 edit-list workaround, see
-  `pipeline.rs` below) is applied uniformly in `pipeline.rs` regardless of
-  which encoder is chosen, rather than special-cased per encoder;
-  `avcodec_open2` silently ignores dictionary keys an encoder doesn't
-  recognize, so this is harmless for encoders without B-frames.
+  lookup — several of these codecs have more than one libav encoder), the
+  pixel format frames are scaled into before encoding, that encoder's own
+  dictionary options, and (for the `*Vaapi` variants) `Some(HwAccel {
+  device_type, encoder_pixel_format })`. Different encoders take different
+  option keys (`preset` for x264/x265; `deadline`+`cpu-used` for
+  libvpx-vp9; `cpu-used` for libaom-av1; no options at all for the VAAPI
+  variants) — this isn't a codec-ID swap. `bf=0` (the mp4 edit-list
+  workaround, see `pipeline.rs` below) is applied uniformly in
+  `pipeline.rs` regardless of which encoder is chosen, rather than
+  special-cased per encoder; `avcodec_open2` silently ignores dictionary
+  keys an encoder doesn't recognize, so this is harmless for encoders
+  without B-frames. `sw_pixel_format` vs `HwAccel::encoder_pixel_format`
+  are deliberately separate fields: for a hardware encoder, frames are
+  scaled to a real software format (`Pixel::NV12`) and then *uploaded* to
+  a hw-accel pixel format (`Pixel::VAAPI`) — see `pipeline.rs`.
 
-- **`src/pipeline.rs`** — all ffmpeg-next work, split across two threads to
-  overlap CPU and GPU work instead of serializing everything (see below):
-  a producer thread demuxes and decodes; the caller's own thread (the
-  "consumer") scales to RGB24, runs the GPU DCT, reassembles, scales to the
-  target pixel format, encodes with the selected `EncoderChoice`, and muxes.
-  Audio is a pure stream copy (no decode/re-encode), remuxed by rescaling
-  packet timestamps into the output's time base. A few non-obvious things
-  worth knowing before editing this file:
-  - **Producer/consumer thread split**: `run_inner` spawns a producer
-    `std::thread` that owns the input format context and decoder, sending
-    a `WorkItem::{Video(VideoFrame), Audio(Packet), Eof, Error(String)}`
-    per unit of work down a bounded `std::sync::mpsc::sync_channel(2)` to
-    the consumer (this function's own calling thread). This means decode of
-    frame N+1 overlaps with the consumer's GPU-wait + encode of frame N,
-    instead of the two running one after another on a single thread (which
-    is what previously produced "100% CPU, 65% GPU" — the GPU sat idle
-    during every scale/encode step and vice versa). **`libswscale`'s
-    `Scaler` (`software::scaling::context::Context`) is not `Send`** (a raw
-    `SwsContext` pointer with no `unsafe impl Send`), so scaling stays on
-    the consumer side — only `ff::format::context::Input`, `decoder::Video`,
-    `ff::Packet`, and `ff::frame::Video` cross the channel, all of which
-    ffmpeg-next explicitly marks `Send`. Don't try to move a `Scaler`
-    across threads without re-checking that.
+- **`src/pipeline.rs`** — all ffmpeg-next work, split across **three**
+  threads (decode / GPU DCT / encode+mux) so each stage's work overlaps
+  the others instead of serializing on one thread. Audio is a pure stream
+  copy (no decode/re-encode), remuxed by rescaling packet timestamps into
+  the output's time base. A few non-obvious things worth knowing before
+  editing this file:
+  - **Three-stage pipeline**: a decode thread demuxes+decodes, sending
+    `WorkItem::{Video(VideoFrame), Audio(Packet), Eof, Error(String)}`
+    down a bounded `std::sync::mpsc::sync_channel(2)`. The GPU stage
+    (scale→GPU DCT→reassemble→scale, PTS tagging, progress reporting)
+    stays on `run_inner`'s own calling thread — **not** a spawned one —
+    and forwards `EncodeItem::{Video(VideoFrame), Audio(Packet), Eof,
+    Error(String)}` down a second channel to a *spawned* encode+mux
+    thread, which owns `send_frame`/mux-write and the final
+    `send_eof`/`write_trailer`, returning the final frame count through
+    its `JoinHandle`. **Which stage is "the calling thread" vs "spawned"
+    is dictated by `Send`, not by pipeline order**: `libswscale`'s
+    `Scaler` (`software::scaling::context::Context`) is not `Send` (a raw
+    `SwsContext` pointer, no `unsafe impl Send`) and so can *never* move
+    into a newly spawned thread — that's why the GPU stage (the one
+    holding the two `Scaler`s) is the thread that already exists rather
+    than one that gets spawned, while `encoder`/`octx` (both confirmed
+    `Send` via ffmpeg-next's `unsafe impl Send for Context`/`for Output`)
+    are what moves into the new encode-stage thread instead. Don't
+    "simplify" this by trying to spawn a GPU-stage thread and keep
+    encode+mux on the caller — that's exactly the arrangement `Send`
+    rules out. This three-way split is what fixed "100% CPU, 65% GPU"
+    (an earlier two-thread version already overlapped decode with
+    GPU+encode; this went further and overlaps GPU-DCT-of-frame-N+1 with
+    encode-of-frame-N too).
+  - **VAAPI hardware encoding** (`EncoderChoice::*Vaapi`): `ffmpeg-next`
+    has no safe wrapper for hwdevice/hwframe APIs at all, so
+    `setup_hw_frames_context`/`encode_hw_frame` in `pipeline.rs` drive
+    them directly through `ff::sys` (raw FFI) — `av_hwdevice_ctx_create`
+    (device=`NULL`, so libva auto-picks the render node) →
+    `av_hwframe_ctx_alloc` → set `format`/`sw_format`/`width`/`height`/
+    `initial_pool_size` on the `AVHWFramesContext` → `av_hwframe_ctx_init`
+    → attach to `AVCodecContext.hw_frames_ctx` **before** opening the
+    encoder (`avcodec_open2` reads it during init). Per frame:
+    `av_hwframe_get_buffer` + `av_hwframe_transfer_data` upload the
+    GPU-stage's software (NV12) frame into a hw frame before
+    `send_frame`. The owning `HwFramesContext` (a thin RAII wrapper
+    around the `*mut AVBufferRef`, `av_buffer_unref`'d on `Drop`) is
+    created during setup on the GPU-stage thread but *used* on the
+    encode-stage thread (per-frame `av_hwframe_get_buffer` calls need it
+    alive there) — moving a raw pointer across that thread boundary needs
+    its own `unsafe impl Send`, justified the same way ffmpeg-next
+    justifies its own: the pointer is a plain refcounted heap handle with
+    no thread affinity, and ownership fully transfers (never aliased
+    across threads). Hardware encoder support is inherently
+    environment/driver-dependent — e.g. on this dev system's AMD/Mesa
+    VAAPI driver, H.264/HEVC/AV1 hw encode all work but VP9 hw encode
+    fails with "no usable encoding entrypoint" (the driver just doesn't
+    expose that capability) — `av_hwdevice_ctx_create` failure and
+    encoder-open failure both surface as ordinary `anyhow` errors through
+    the normal `PipelineMsg::Error` path, never a panic.
   - The mov/mp4 muxer's auto edit-list logic silently drops the last encoded
     video frame under some conditions; `write_header_with` passes
     `use_editlist=0` for mp4-family outputs to avoid that. That's an
@@ -151,9 +197,9 @@ pages) → `pipeline.rs` (decode/encode orchestration via ffmpeg-next, using
   - `PipelineMsg` is the channel payload (`Progress`/`Log`/`Done`/`Error`),
     sent over a `tokio::sync::mpsc::UnboundedSender` (aliased as `Sender`
     via `use tokio::sync::mpsc::UnboundedSender as Sender` — `send()` is
-    still a plain synchronous call, so the producer/consumer thread code
-    didn't need to become async). This is a *different* channel from the
-    internal producer→consumer `WorkItem` one above — `PipelineMsg` is the
+    still a plain synchronous call, so none of the three pipeline threads
+    needed to become async). This is a *different* channel from the
+    internal `WorkItem`/`EncodeItem` ones above — `PipelineMsg` is the
     outward-facing progress/log feed the UI subscribes to.
   - `PipelineMsg::Log` (→ the UI's in-app log panel) and `tracing::{info,
     debug,warn,error}!` (→ stderr/whatever subscriber `main.rs` installs)
