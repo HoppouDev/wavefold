@@ -4,21 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`dctenc` — a native Rust/iced desktop app (plus a headless `dctenc-cli`
-binary) that applies a whole-frame DCT "distortion" effect to video: decode
-→ per-frame DCT compress/reconstruct on a user-selectable compute backend
-(GPU via wgpu, or a pure-CPU fallback) → re-encode with a user-selectable
-encoder — software (libx264/libx265/libvpx-vp9/libaom-av1) or VAAPI hardware
-— with audio passed through untouched. This is a visual effect tool, not a
-real codec — the point is the ringing/ghosting artifact the DCT cutoff
-produces, not compression efficiency.
+`dctenc` — a single native Rust binary (desktop GUI via iced, or headless via
+a `clap` subcommand) that applies a whole-frame DCT "distortion" effect to
+video: decode → per-frame DCT compress/reconstruct on a user-selectable
+compute backend (GPU via wgpu, or a pure-CPU fallback) → re-encode with a
+user-selectable encoder — software (libx264/libx265/libvpx-vp9/libaom-av1)
+or VAAPI hardware — with audio passed through untouched. This is a visual
+effect tool, not a real codec — the point is the ringing/ghosting artifact
+the DCT cutoff produces, not compression efficiency.
 
 ## Commands
 
 ```bash
-cargo build --release                            # release build: GUI (dctenc) + CLI (dctenc-cli) binaries
-cargo run --release                               # launch the iced GUI
-cargo run --release --bin dctenc-cli -- <in> <out> [--cutoff F] [--encoder ...] [--backend gpu|cpu]
+cargo build --release                             # release build: single dctenc binary
+dctenc                                            # launch the iced GUI (default with no subcommand)
+dctenc gui                                        # same, explicit
+dctenc encode <in> <out> [--cutoff F] [--encoder ...] [--backend gpu|cpu]  # headless, no display server needed
 cargo check                                       # fast typecheck, iterate with this first
 cargo test --release                              # unit tests (gpu.rs, cpu.rs, dct_math.rs, pipeline.rs) + tests/integration.rs
 cargo test --release <name>                       # run a single test by substring, e.g. `cargo test --release roundtrip`
@@ -33,7 +34,7 @@ backend needs no GPU at all. `tests/integration.rs` shells out to the
 `ffmpeg` CLI (not `ffmpeg-next`) purely to generate synthetic test-fixture
 clips; it also skips gracefully if `ffmpeg` isn't on `PATH`.
 
-`.github/workflows/ci.yml` runs `dctenc-cli --backend cpu` inside an
+`.github/workflows/ci.yml` runs `dctenc encode --backend cpu` inside an
 Arch Linux container on a standard (GPU-less) `ubuntu-latest` runner — see
 the workflow file's comments for why Arch specifically (this repo's pinned
 `ffmpeg-next` major version needs to match the installed FFmpeg's, and
@@ -68,8 +69,8 @@ pipeline error, not a build failure.
 
 ## Architecture
 
-Pipeline, one direction: `main.rs` (iced bootstrap) or `bin/dctenc-cli.rs`
-(headless clap CLI) → `ui/` (setup/encoding pages, GUI only) →
+Pipeline, one direction: `main.rs` (clap entry point, dispatches to the iced
+GUI or a headless encode) → `ui/` (setup/encoding pages, GUI path only) →
 `pipeline.rs` (decode/encode orchestration via ffmpeg-next, using
 `encoders.rs` for the chosen output codec) → `dct_backend.rs`'s
 `ComputeBackend` (GPU or CPU) → `gpu.rs` (wgpu compute) / `cpu.rs` (plain
@@ -77,26 +78,33 @@ Rust + rayon), both driven by the same basis math in `dct_math.rs` → (GPU
 only) `shader.wgsl`.
 
 - **`src/lib.rs`** re-exports `pub mod cpu; pub mod dct_backend; mod
-  dct_math; pub mod encoders; pub mod gpu; pub mod pipeline;` so both binary
-  targets (`main.rs`/`ui/` for the GUI, `bin/dctenc-cli.rs` for the CLI) and
-  `tests/integration.rs` link against the same public API — this split
-  exists specifically so the pipeline can be exercised without a GUI.
-  `dct_math` is deliberately *not* `pub` — it's `pub(crate)` plumbing shared
-  only between `gpu.rs` and `cpu.rs`, not part of the crate's public
-  surface. `ui/` and `main.rs` are binary-only (not part of the library)
-  since they're not exercised by `tests/integration.rs`.
+  dct_math; pub mod encoders; pub mod gpu; pub mod pipeline;` so both the
+  `dctenc` binary (`main.rs`/`ui/`) and `tests/integration.rs` link against
+  the same public API — this split exists specifically so the pipeline can
+  be exercised without a GUI. `dct_math` is deliberately *not* `pub` — it's
+  `pub(crate)` plumbing shared only between `gpu.rs` and `cpu.rs`, not part
+  of the crate's public surface. `ui/` and `main.rs` are binary-only (not
+  part of the library) since they're not exercised by `tests/integration.rs`.
 
-- **`src/bin/dctenc-cli.rs`** — headless entry point, auto-discovered by
-  Cargo as a second binary target (no `[[bin]]` needed in `Cargo.toml`) from
-  anything under `src/bin/*.rs`. A `clap::Parser` struct (`input`, `output`,
-  `--cutoff`, `--encoder`, `--backend`) parses args, spawns `pipeline::run`
-  on a `std::thread` exactly like `ui/encoding.rs` does (it's a blocking
-  call, not async), then drives the `tokio::sync::mpsc` receiver on the main
-  thread with `rx.blocking_recv()` — this works fine with no tokio runtime
-  present, which is exactly what `blocking_recv` is for; the CLI has no
-  other use for tokio. Exits `1` on `PipelineMsg::Error`. This is the
-  binary `.github/workflows/ci.yml` runs with `--backend cpu` on a GPU-less
-  runner.
+- **`src/main.rs`** — single binary, one `clap::Parser` (`Cli { command:
+  Option<Command> }`) with two subcommands: `Gui` (also the default when no
+  subcommand is given, via `.unwrap_or(Command::Gui)` — preserves the old
+  "just run the binary" muscle memory) and `Encode { input, output, cutoff,
+  encoder, backend }`. `run_gui()` is the same
+  `iced::application(ui::App::default, ui::App::update, ui::App::view).run()`
+  bootstrap the binary always had; `run_encode(...)` is the former
+  `dctenc-cli` binary's body verbatim — spawns `pipeline::run` on a
+  `std::thread` exactly like `ui/encoding.rs` does (it's a blocking call,
+  not async), then drives the `tokio::sync::mpsc` receiver on the main
+  thread with `rx.blocking_recv()` (works fine with no tokio runtime
+  present, which is exactly what `blocking_recv` is for), exiting `1` on
+  `PipelineMsg::Error`. Merging both entry points into one binary means the
+  `encode` subcommand now always links `iced`/`wgpu` too (they were
+  previously a separate `dctenc-cli` binary that skipped that dependency
+  weight) — harmless, since `run_gui()` is simply never called on that
+  path; no window/GPU surface is touched unless the `Gui` branch runs. This
+  is the binary `.github/workflows/ci.yml` runs as `dctenc encode --backend
+  cpu` on a GPU-less runner.
 
 - **`src/dct_backend.rs`** — `DctBackend` (the trait `gpu.rs`'s `DctGpu` and
   `cpu.rs`'s `DctCpu` both implement: one `process_rgb(r, g, b, width,
@@ -116,10 +124,6 @@ only) `shader.wgsl`.
   result to GPU buffers) and `cpu.rs` (uses it directly as the transform
   matrices) — pulled out specifically so the two compute backends can never
   silently drift onto different basis matrices.
-
-- **`src/main.rs`** — a 9-line bootstrap: `mod ui;` plus
-  `iced::application(ui::App::default, ui::App::update, ui::App::view)`.
-  All actual UI logic lives in `src/ui/`.
 
 - **`src/ui/`** — iced 0.14 app (`features = ["tokio"]`, so iced's executor
   is a real tokio runtime), split into two pages following iced's documented

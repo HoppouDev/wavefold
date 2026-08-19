@@ -23,7 +23,7 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - name: Build (GUI + CLI binaries)
+      - name: Build (single dctenc binary: gui/encode subcommands)
         run: cargo build --release
 
       - name: Run library/unit tests (CPU-backend tests need no GPU)
@@ -34,9 +34,9 @@ jobs:
           ffmpeg -v error -f lavfi -i testsrc=size=160x120:duration=1:rate=8 \
             -pix_fmt yuv420p -y sample.mp4
 
-      - name: Encode with the CLI (CPU DCT backend, software encoder)
+      - name: Encode headlessly (CPU DCT backend, software encoder)
         run: |
-          cargo run --release --bin dctenc-cli -- \
+          cargo run --release -- encode \
             sample.mp4 out.mp4 --backend cpu --encoder h264
 
       - name: Verify output was produced
