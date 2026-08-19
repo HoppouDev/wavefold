@@ -9,6 +9,7 @@ use ff::Rescale;
 use rayon::prelude::*;
 use std::path::Path;
 use std::sync::mpsc::Sender;
+use tracing::{debug, error, info, warn};
 
 pub enum PipelineMsg {
     Progress { current: u64, total: u64 },
@@ -29,6 +30,7 @@ enum WorkItem {
 
 pub fn run(input: &Path, output: &Path, cutoff: f32, tx: Sender<PipelineMsg>) {
     if let Err(e) = run_inner(input, output, cutoff, &tx) {
+        error!("pipeline failed: {e:#}");
         let _ = tx.send(PipelineMsg::Error(format!("{e:#}")));
     }
 }
@@ -113,6 +115,7 @@ fn join_rgb_planes(width: u32, height: u32, r: &[f32], g: &[f32], b: &[f32]) -> 
 fn run_inner(input_path: &Path, output_path: &Path, cutoff: f32, tx: &Sender<PipelineMsg>) -> Result<()> {
     ff::init()?;
 
+    info!(path = %input_path.display(), "opening input");
     let _ = tx.send(PipelineMsg::Log("opening input...".into()));
     let mut ictx = ff::format::input(input_path)?;
 
@@ -158,6 +161,7 @@ fn run_inner(input_path: &Path, output_path: &Path, cutoff: f32, tx: &Sender<Pip
         bail!("could not read video dimensions (unsupported file?)");
     }
 
+    info!(width, height, fps, cutoff, "decoded input parameters");
     let _ = tx.send(PipelineMsg::Log(format!(
         "{width}x{height} @ {fps:.3} fps, cutoff={cutoff:.3}"
     )));
@@ -165,15 +169,19 @@ fn run_inner(input_path: &Path, output_path: &Path, cutoff: f32, tx: &Sender<Pip
     // pixel (not a fast O(N log N) transform), so cost grows steeply with
     // resolution — warn rather than let it look like a hang.
     if (width as u64) * (height as u64) > 640 * 480 {
+        warn!(width, height, "resolution is large for a whole-frame DCT; expect this to be slow");
         let _ = tx.send(PipelineMsg::Log(
             "warning: this resolution is large for a whole-frame DCT (cost grows ~quadratically); expect this to be slow".into(),
         ));
     }
     if audio_stream_index.is_some() {
+        debug!("audio stream found: will pass through unchanged");
         let _ = tx.send(PipelineMsg::Log("audio stream found: will pass through unchanged".into()));
     } else {
+        debug!("no audio stream found");
         let _ = tx.send(PipelineMsg::Log("no audio stream found".into()));
     }
+    info!("initializing GPU DCT pipeline");
     let _ = tx.send(PipelineMsg::Log("initializing GPU DCT pipeline...".into()));
     let gpu = DctGpu::new().map_err(|e| anyhow!("GPU init failed: {e:#}"))?;
 
@@ -189,6 +197,7 @@ fn run_inner(input_path: &Path, output_path: &Path, cutoff: f32, tx: &Sender<Pip
 
     let mut octx = ff::format::output(output_path)?;
     let codec = ff::encoder::find(ff::codec::Id::H264).ok_or_else(|| anyhow!("no H264 encoder available"))?;
+    debug!(codec = codec.name(), "video encoder selected");
 
     let enc_time_base = ff::Rational::new(frame_rate.denominator(), frame_rate.numerator().max(1));
 
@@ -395,6 +404,7 @@ fn run_inner(input_path: &Path, output_path: &Path, cutoff: f32, tx: &Sender<Pip
     drain_encoder(&mut encoder, &mut octx, video_ost_index, ost_time_base)?;
     octx.write_trailer()?;
 
+    info!(frames = frame_idx, path = %output_path.display(), "encode complete");
     let _ = tx.send(PipelineMsg::Log(format!(
         "wrote {} frames to {}",
         frame_idx,

@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use bytemuck::{Pod, Zeroable};
 use std::cell::RefCell;
 use std::f32::consts::PI;
+use tracing::debug;
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
@@ -111,6 +112,8 @@ impl DctGpu {
             apply_limit_buckets: false,
         }))
         .context("no compatible GPU adapter found")?;
+        let adapter_info = adapter.get_info();
+        debug!(name = %adapter_info.name, backend = ?adapter_info.backend, "GPU adapter selected");
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("dctenc device"),
@@ -290,12 +293,14 @@ impl DctGpu {
             if !dims_match {
                 // Dimensions changed (or first use): full rebuild, including
                 // the O(width^2+height^2) basis matrices.
+                debug!(channel, width, height, "rebuilding GPU basis buffers (dimensions changed)");
                 *cache = Some(self.build_plane_buffers(width, height, cutoff, size_bytes));
             } else if let Some(b) = cache.as_mut() {
                 if b.cutoff != cutoff {
                     // Same frame size, only the cutoff knob moved: rewrite
                     // just the threshold in place, skip regenerating/
                     // re-uploading the (unchanged) basis matrices.
+                    debug!(channel, cutoff, "updating cutoff threshold in place (dimensions unchanged)");
                     let threshold = cutoff.clamp(0.0, 2.0) + f32::EPSILON;
                     let params = Params {
                         width,

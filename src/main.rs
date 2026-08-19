@@ -138,6 +138,7 @@ impl eframe::App for App {
 }
 
 fn main() -> eframe::Result<()> {
+    tracing_subscriber::fmt::init();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([640.0, 520.0]),
         ..Default::default()
