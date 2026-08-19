@@ -1,28 +1,28 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file guide Claude Code (claude.ai/code) working code this repo.
 
 ## What this is
 
-`wavefold` — a single native Rust binary (desktop GUI via iced, or headless via
-a `clap` subcommand) that applies a whole-frame DCT "distortion" effect to
-video: decode → per-frame DCT compress/reconstruct on a user-selectable
-compute backend (GPU via wgpu, or a pure-CPU fallback) → re-encode with a
+`wavefold` — single native Rust binary (desktop GUI via iced, or headless via
+`clap` subcommand). Apply whole-frame DCT "distortion" effect to video:
+decode, per-frame DCT compress/reconstruct on user-selectable compute
+backend (GPU via wgpu, or pure-CPU fallback), re-encode with
 user-selectable encoder — software (x264/x265/vp9/av1 GStreamer elements)
-or VAAPI hardware — with audio passed through untouched. This is a visual
-effect tool, not a real codec — the point is the ringing/ghosting artifact
-the DCT cutoff produces, not compression efficiency.
+or VAAPI hardware — audio pass through untouched. Visual effect tool, not
+real codec — point is ringing/ghosting artifact DCT cutoff produce, not
+compression efficiency.
 
-Media I/O (`pipeline.rs`/`encoders.rs`) is built on **GStreamer**
-(`gstreamer`/`gstreamer-app`/`gstreamer-video`), not FFmpeg — this replaced
-an earlier `ffmpeg-next`-based implementation specifically because
+Media I/O (`pipeline.rs`/`encoders.rs`) built on **GStreamer**
+(`gstreamer`/`gstreamer-app`/`gstreamer-video`), not FFmpeg — replaced
+earlier `ffmpeg-next`-based implementation specifically because
 `ffmpeg-sys-next` declares `links = "ffmpeg"`, and Cargo hard-bans two
-versions of a `links`-crate coexisting in one dependency graph, which made
-it structurally impossible for one `Cargo.toml` to build against both this
-dev machine's FFmpeg (Arch, rolling) and a stock Ubuntu CI runner's older
-one at the same time. GStreamer's C API/ABI has been stable since 1.0
-(2012), so one `gstreamer` crate version builds against a wide range of
-installed GStreamer versions without that problem.
+versions of `links`-crate coexisting one dependency graph — made
+structurally impossible for one `Cargo.toml` build against both this dev
+machine's FFmpeg (Arch, rolling) and stock Ubuntu CI runner's older one
+same time. GStreamer's C API/ABI stable since 1.0 (2012), so one
+`gstreamer` crate version builds against wide range installed GStreamer
+versions, no problem.
 
 ## Commands
 
@@ -36,184 +36,179 @@ cargo test --release                           # unit tests (gpu.rs, cpu.rs, dct
 cargo test --release <name>                    # run a single test by substring, e.g. `cargo test --release roundtrip`
 ```
 
-GPU tests (in `src/gpu.rs`, plus the cross-check test in `src/cpu.rs`)
-require a real wgpu adapter and skip gracefully (printing to stderr, not
-failing) if `DctGpu::new()` can't find one — expect skips in a
-headless/adapterless sandbox. CPU-backend tests (`src/cpu.rs`) have no such
-guard and always run — this is deliberate, since it's the proof the CPU
-backend needs no GPU at all. `tests/integration.rs` shells out to the
-`ffmpeg` CLI (not `ffmpeg-next`) purely to generate synthetic test-fixture
-clips; it also skips gracefully if `ffmpeg` isn't on `PATH`.
+GPU tests (in `src/gpu.rs`, plus cross-check test `src/cpu.rs`) need real
+wgpu adapter, skip gracefully (print stderr, not fail) if `DctGpu::new()`
+find none — expect skips headless/adapterless sandbox. CPU-backend tests
+(`src/cpu.rs`) no such guard, always run — deliberate, proof CPU backend
+need no GPU at all. `tests/integration.rs` shells out `ffmpeg` CLI (not
+`ffmpeg-next`) purely generate synthetic test-fixture clips; also skips
+gracefully if `ffmpeg` not on `PATH`.
 
-`.github/workflows/ci.yml` runs `wavefold encode --backend cpu` on a plain
-`ubuntu-latest` runner (no container workaround needed — see the "What this
-is" section above for why the GStreamer rewrite is specifically what made
-that possible).
+`.github/workflows/ci.yml` runs `wavefold encode --backend cpu` on plain
+`ubuntu-latest` runner (no container workaround needed — see "What this
+is" section above why GStreamer rewrite specifically made that possible).
 
 `RUST_LOG=debug cargo run --release` (or any `tracing`-compatible env filter)
-surfaces the `tracing` diagnostics described below — the app has no other
-logging config checked in.
+surfaces `tracing` diagnostics described below — app has no other logging
+config checked in.
 
-No lint/format config is checked in; `cargo fmt` / `cargo clippy` apply with
-their defaults if needed.
+No lint/format config checked in; `cargo fmt` / `cargo clippy` apply
+defaults if needed.
 
 ### System dependencies
 
-`gstreamer-sys`/`gstreamer-app-sys`/`gstreamer-video-sys` bind against the
+`gstreamer-sys`/`gstreamer-app-sys`/`gstreamer-video-sys` bind against
 system's libgstreamer-1.0/libgstapp-1.0/libgstvideo-1.0 via `pkg-config` —
-unlike the old ffmpeg-next setup, there's no major-version-must-match
-constraint (GStreamer's C ABI has been stable since 1.0), so any reasonably
-current GStreamer dev install works. For a from-scratch build you need:
-`pkg-config`, `libgstreamer1.0-dev`, `libgstreamer-plugins-base1.0-dev`
-(Debian/Ubuntu naming; `gstreamer`/`gst-plugins-base` on Arch) for the
-headers, **plus the actual plugins at runtime** — `gst-plugins-good`
-(`vp9enc`), `gst-plugins-bad` (`x265enc`, `av1enc`, the `va` VAAPI plugin),
-`gst-plugins-ugly` (`x264enc`) — an `EncoderChoice` whose element isn't
-installed fails at pipeline-construction time with a clear error (`gst::
-ElementFactory::make` returning `None`), not at compile time. Also install
-`gstreamer1.0-libav` (or your distro's equivalent) for broad-codec
-*decoding* — this repo's own dev/CI environment needed it because the
+unlike old ffmpeg-next setup, no major-version-must-match constraint
+(GStreamer's C ABI stable since 1.0), so any reasonably current GStreamer
+dev install works. From-scratch build need: `pkg-config`,
+`libgstreamer1.0-dev`, `libgstreamer-plugins-base1.0-dev` (Debian/Ubuntu
+naming; `gstreamer`/`gst-plugins-base` on Arch) for headers, **plus actual
+plugins at runtime** — `gst-plugins-good` (`vp9enc`), `gst-plugins-bad`
+(`x265enc`, `av1enc`, `va` VAAPI plugin), `gst-plugins-ugly` (`x264enc`) —
+`EncoderChoice` whose element not installed fails at pipeline-construction
+time, clear error (`gst::
+ElementFactory::make` returning `None`), not
+compile time. Also install `gstreamer1.0-libav` (or distro equivalent) for
+broad-codec *decoding* — this repo's own dev/CI environment needed it,
 default `openh264dec` decoder can't handle every H.264 profile FFmpeg
-itself can produce (see `pipeline.rs`'s decode-side notes below). The
-`va`-plugin VAAPI elements (`vah264enc`/`vah265enc`/`vaav1enc`) additionally
-need a VAAPI-capable GPU/driver (`libva`, a `/dev/dri/renderD*` node) at
-*runtime* to even register as available element factories — with no such
-device, `gst_inspect_1.0 va` still loads the plugin but the individual
-codec elements just don't exist, so `ElementFactory::make("vah264enc")`
-fails the same clean way as a genuinely-uninstalled plugin, not a build
-failure.
+itself produce (see `pipeline.rs`'s decode-side notes below). `va`-plugin
+VAAPI elements (`vah264enc`/`vah265enc`/`vaav1enc`) additionally need
+VAAPI-capable GPU/driver (`libva`, `/dev/dri/renderD*` node) at *runtime*
+to even register as available element factories — no such device,
+`gst_inspect_1.0 va` still loads plugin but individual codec elements just
+don't exist, so `ElementFactory::make("vah264enc")` fails same clean way
+as genuinely-uninstalled plugin, not build failure.
 
 ## Architecture
 
-Pipeline, one direction: `main.rs` (clap entry point, dispatches to the iced
-GUI or a headless encode) → `ui/` (setup/encoding pages, GUI path only) →
-`pipeline.rs` (a `gst::Pipeline` built and driven via `gstreamer`/
-`gstreamer-app`/`gstreamer-video`, using `encoders.rs` for the chosen output
+Pipeline, one direction: `main.rs` (clap entry point, dispatch to iced
+GUI or headless encode) → `ui/` (setup/encoding pages, GUI path only) →
+`pipeline.rs` (`gst::Pipeline` built, driven via `gstreamer`/
+`gstreamer-app`/`gstreamer-video`, using `encoders.rs` for chosen output
 codec's element) → `dct_backend.rs`'s `ComputeBackend` (GPU or CPU) →
-`gpu.rs` (wgpu compute) / `cpu.rs` (plain Rust + rayon), both driven by the
-same basis math in `dct_math.rs` → (GPU only) `shader.wgsl`.
+`gpu.rs` (wgpu compute) / `cpu.rs` (plain Rust + rayon), both driven by
+same basis math `dct_math.rs` → (GPU only) `shader.wgsl`.
 
 - **`src/lib.rs`** re-exports `pub mod cpu; pub mod dct_backend; mod
-  dct_math; pub mod encoders; pub mod gpu; pub mod pipeline;` so both the
-  `wavefold` binary (`main.rs`/`ui/`) and `tests/integration.rs` link against
-  the same public API — this split exists specifically so the pipeline can
-  be exercised without a GUI. `dct_math` is deliberately *not* `pub` — it's
-  `pub(crate)` plumbing shared only between `gpu.rs` and `cpu.rs`, not part
-  of the crate's public surface. `ui/` and `main.rs` are binary-only (not
-  part of the library) since they're not exercised by `tests/integration.rs`.
+  dct_math; pub mod encoders; pub mod gpu; pub mod pipeline;` so both
+  `wavefold` binary (`main.rs`/`ui/`) and `tests/integration.rs` link
+  against same public API — split exists specifically so pipeline
+  exercised without GUI. `dct_math` deliberately *not* `pub` — `pub(crate)`
+  plumbing shared only between `gpu.rs` and `cpu.rs`, not part crate's
+  public surface. `ui/` and `main.rs` binary-only (not part library) since
+  not exercised by `tests/integration.rs`.
 
 - **`src/main.rs`** — single binary, one `clap::Parser` (`Cli { command:
-  Option<Command> }`) with two subcommands: `Gui` (also the default when no
-  subcommand is given, via `.unwrap_or(Command::Gui)` — preserves the old
-  "just run the binary" muscle memory) and `Encode { input, output, cutoff,
-  encoder, backend }`. `run_gui()` is the same
+  Option<Command> }`) with two subcommands: `Gui` (also default when no
+  subcommand given, via `.unwrap_or(Command::Gui)` — preserves old "just
+  run binary" muscle memory) and `Encode { input, output, cutoff,
+  encoder, backend }`. `run_gui()` same
   `iced::application(ui::App::default, ui::App::update, ui::App::view).run()`
-  bootstrap the binary always had; `run_encode(...)` is the former
-  `wavefold-cli` binary's body verbatim — spawns `pipeline::run` on a
-  `std::thread` exactly like `ui/encoding.rs` does (it's a blocking call,
-  not async), then drives the `tokio::sync::mpsc` receiver on the main
-  thread with `rx.blocking_recv()` (works fine with no tokio runtime
-  present, which is exactly what `blocking_recv` is for), exiting `1` on
-  `PipelineMsg::Error`. Merging both entry points into one binary means the
-  `encode` subcommand now always links `iced`/`wgpu` too (they were
-  previously a separate `wavefold-cli` binary that skipped that dependency
-  weight) — harmless, since `run_gui()` is simply never called on that
-  path; no window/GPU surface is touched unless the `Gui` branch runs. This
-  is the binary `.github/workflows/ci.yml` runs as `wavefold encode --backend
-  cpu` on a GPU-less runner.
+  bootstrap binary always had; `run_encode(...)` former `wavefold-cli`
+  binary's body verbatim — spawns `pipeline::run` on `std::thread` exactly
+  like `ui/encoding.rs` does (blocking call, not async), then drives
+  `tokio::sync::mpsc` receiver on main thread with `rx.blocking_recv()`
+  (works fine no tokio runtime present, exactly what `blocking_recv` for),
+  exits `1` on `PipelineMsg::Error`. Merging both entry points one binary
+  means `encode` subcommand now always links `iced`/`wgpu` too (previously
+  separate `wavefold-cli` binary skipped that dependency weight) —
+  harmless, since `run_gui()` simply never called that path; no window/GPU
+  surface touched unless `Gui` branch runs. This binary
+  `.github/workflows/ci.yml` runs as `wavefold encode --backend
+  cpu` on
+  GPU-less runner.
 
-- **`src/dct_backend.rs`** — `DctBackend` (the trait `gpu.rs`'s `DctGpu` and
+- **`src/dct_backend.rs`** — `DctBackend` (trait `gpu.rs`'s `DctGpu` and
   `cpu.rs`'s `DctCpu` both implement: one `process_rgb(r, g, b, width,
-  height, cutoff)` method) and `ComputeBackend` (the user-facing `Gpu`/`Cpu`
+  height, cutoff)` method) and `ComputeBackend` (user-facing `Gpu`/`Cpu`
   choice — same enum+`ALL`+`Display`+resolver shape as `EncoderChoice` in
-  `encoders.rs`, and for the same reason: one switchable choice the GUI
-  pick_list and the CLI's `--backend` flag both need). `ComputeBackend::
-  build()` is the single place that turns the choice into a live
-  `Box<dyn DctBackend>` (`DctGpu::new()`, which can fail with no compatible
-  adapter, vs. `DctCpu::new()`, which can't fail). Also derives
-  `clap::ValueEnum` (as does `EncoderChoice`) so the CLI's `--backend`/
-  `--encoder` flags share one source of truth with the GUI's pick_lists
-  instead of a separate hand-maintained CLI-side enum.
+  `encoders.rs`, same reason: one switchable choice GUI pick_list and
+  CLI's `--backend` flag both need). `ComputeBackend::
+  build()` single
+  place turns choice into live `Box<dyn DctBackend>` (`DctGpu::new()`, can
+  fail no compatible adapter, vs `DctCpu::new()`, can't fail). Also
+  derives `clap::ValueEnum` (as does `EncoderChoice`) so CLI's
+  `--backend`/`--encoder` flags share one source of truth with GUI's
+  pick_lists instead of separate hand-maintained CLI-side enum.
 
-- **`src/dct_math.rs`** — `dct_basis`/`transpose_square`, the pure-CPU
-  matrix-generation math shared verbatim by both `gpu.rs` (uploads the
-  result to GPU buffers) and `cpu.rs` (uses it directly as the transform
-  matrices) — pulled out specifically so the two compute backends can never
-  silently drift onto different basis matrices.
+- **`src/dct_math.rs`** — `dct_basis`/`transpose_square`, pure-CPU
+  matrix-generation math shared verbatim by both `gpu.rs` (uploads result
+  GPU buffers) and `cpu.rs` (uses directly as transform matrices) — pulled
+  out specifically so two compute backends never silently drift different
+  basis matrices.
 
-- **`src/ui/`** — iced 0.14 app (`features = ["tokio"]`, so iced's executor
-  is a real tokio runtime), split into two pages following iced's documented
-  multi-screen pattern:
+- **`src/ui/`** — iced 0.14 app (`features = ["tokio"]`, so iced's
+  executor real tokio runtime), split into two pages following iced's
+  documented multi-screen pattern:
   - **`ui/mod.rs`** — `App` wraps `enum Screen { Setup(setup::State),
-    Encoding(encoding::State) }` and a wrapper `Message` enum; `App::update`
-    dispatches to whichever screen is active and applies the `Action` each
-    screen's own `update` returns (`setup::Action::Start{..}` swaps
-    `Screen` to `Encoding` and kicks off the encode; `encoding::
-    Action::BackToSetup` swaps back to a fresh `Setup`). A screen never
-    mutates the other screen's state or the top-level `Screen` directly —
-    only `App::update` does, based on the `Action` it gets back. Stray
-    messages for a screen you've since navigated away from (e.g. a
-    file-dialog result resolving after leaving Setup) are silently dropped
-    in the dispatch match.
+    Encoding(encoding::State) }` and wrapper `Message` enum; `App::update`
+    dispatches to whichever screen active, applies `Action` each screen's
+    own `update` returns (`setup::Action::Start{..}` swaps `Screen` to
+    `Encoding`, kicks off encode; `encoding::
+    Action::BackToSetup` swaps
+    back to fresh `Setup`). Screen never mutates other screen's state or
+    top-level `Screen` directly — only `App::update` does, based on
+    `Action` it gets back. Stray messages for screen navigated away from
+    (e.g. file-dialog result resolving after leaving Setup) silently
+    dropped in dispatch match.
   - **`ui/setup.rs`** — input/output file pickers (`rfd::AsyncFileDialog`
-    via `Task::perform`, not the old synchronous `rfd::FileDialog`), the
-    cutoff slider, the encoder `pick_list` (`EncoderChoice` implements
-    `Display` in `encoders.rs` specifically for this), a second `pick_list`
-    for `ComputeBackend` (same `Display`-via-`label()` pattern, in
-    `dct_backend.rs`), and the Encode button (`on_press_maybe`, only enabled
-    once both paths are set).
+    via `Task::perform`, not old synchronous `rfd::FileDialog`), cutoff
+    slider, encoder `pick_list` (`EncoderChoice` implements `Display` in
+    `encoders.rs` specifically for this), second `pick_list` for
+    `ComputeBackend` (same `Display`-via-`label()` pattern, in
+    `dct_backend.rs`), Encode button (`on_press_maybe`, only enabled once
+    both paths set).
   - **`ui/encoding.rs`** — `State::start(input, output, cutoff, encoder,
-    backend)` spawns `pipeline::run` on a plain `std::thread` (it's a
-    blocking call,
-    not async — spawning it as a tokio task would tie up an executor
-    thread for the whole encode) and returns a `Task` that streams its
-    `tokio::sync::mpsc` progress channel back via `Task::run(
+    backend)` spawns `pipeline::run` on plain `std::thread` (blocking
+    call, not async — spawning as tokio task would tie up executor thread
+    whole encode), returns `Task` streaming `tokio::sync::mpsc` progress
+    channel back via `Task::run(
     UnboundedReceiverStream::new(rx), Message::Pipeline).chain(Task::done(
     Message::WorkerDone))` — progress arrives reactively as messages
-    instead of the old egui-era pattern of polling a channel every frame.
-    Shows the progress bar, a scrollable log, and a "New encode" button
-    (enabled once the worker reports done) that returns `Action::
+    instead of old egui-era pattern polling channel every frame. Shows
+    progress bar, scrollable log, "New encode" button (enabled once worker
+    reports done) returning `Action::
     BackToSetup`.
 
 - **`src/encoders.rs`** — `EncoderChoice` (8 variants: H264/H265/Vp9/Av1,
-  each with a `*Vaapi` hardware counterpart) and its `profile()` →
+  each with `*Vaapi` hardware counterpart) and its `profile()` →
   `EncoderProfile { element_factory_name, properties, parser, hardware }`:
-  the GStreamer element factory name for `gst::ElementFactory::make` (not a
-  codec-ID lookup — several of these codecs have more than one GStreamer
-  encoder element), that element's own properties (set via
-  `set_property_from_str`, which type-coerces from a plain string
-  regardless of whether the property is itself a string, enum, or
-  integer), and an optional bitstream parser element name. Different
-  encoders take entirely different property sets — `tune=zerolatency` for
-  x264/x265; `deadline`+`lag-in-frames` for vp9; `cpu-used`+
-  `lag-in-frames` for av1; no properties for the VAAPI variants — this
-  isn't a codec-ID swap.
-  - **Every software encoder needs its internal lookahead/B-frame
-    buffering disabled** (frame-in, frame-out), or it can fail to emit a
-    first output packet fast enough for the muxer (a `GstAggregator`) to
-    complete preroll on that pad — which stalls the **whole pipeline's**
-    `Paused`->`Playing` transition forever, not just that one branch
-    (`appsink` only ever delivers its one preroll buffer while stuck in
-    `Paused`; confirmed by reproducing this exact hang with `x264enc`'s
-    defaults). The fix differs per encoder (`tune=zerolatency` for x264/
-    x265; `lag-in-frames=0` for vp9/av1) so each is set explicitly rather
-    than assumed to share x264's property names. VAAPI encoders don't need
-    this: `b-frames` already defaults to `0`.
+  GStreamer element factory name for `gst::ElementFactory::make` (not
+  codec-ID lookup — several codecs have more than one GStreamer encoder
+  element), that element's own properties (set via
+  `set_property_from_str`, type-coerces from plain string regardless
+  whether property itself string, enum, or integer), optional bitstream
+  parser element name. Different encoders take entirely different
+  property sets — `tune=zerolatency` for x264/x265; `deadline`+
+  `lag-in-frames` for vp9; `cpu-used`+`lag-in-frames` for av1; no
+  properties for VAAPI variants — not codec-ID swap.
+  - **Every software encoder needs internal lookahead/B-frame buffering
+    disabled** (frame-in, frame-out), or can fail emit first output
+    packet fast enough for muxer (a `GstAggregator`) complete preroll on
+    that pad — stalls **whole pipeline's** `Paused`->`Playing` transition
+    forever, not just one branch (`appsink` only ever delivers one
+    preroll buffer while stuck in `Paused`; confirmed reproducing this
+    exact hang with `x264enc`'s defaults). Fix differs per encoder
+    (`tune=zerolatency` for x264/x265; `lag-in-frames=0` for vp9/av1) so
+    each set explicitly rather than assumed to share x264's property
+    names. VAAPI encoders don't need this: `b-frames` already defaults to
+    `0`.
   - **`parser: Option<&'static str>`** (`h264parse`/`h265parse`) is
-    inserted between the encoder and the muxer's request pad — standard
+    inserted between encoder and muxer's request pad — standard
     GStreamer practice, and *required* in practice for H.265: `x265enc`'s
-    raw output caps don't have a format `qtmux`/`matroskamux`'s video pad
+    raw output caps don't have format `qtmux`/`matroskamux`'s video pad
     template accepts directly (fails with "Pads do not have common
-    format" otherwise, confirmed). `h264parse` is inserted uniformly too
+    format" otherwise, confirmed). `h264parse` inserted uniformly too
     even though `x264enc` happened to link without one — cheap insurance
-    against the same class of failure on a muxer/version this wasn't
-    tested against. VP9/AV1 need no parser.
+    against same class of failure on muxer/version this wasn't tested
+    against. VP9/AV1 need no parser.
   - **No `vavp9enc` exists** in GStreamer's `va` plugin (confirmed against
     this machine's real AMD/Mesa VAAPI driver: only `vavp9dec` registers,
-    no encoder) — the same VP9-hw-encode gap this project already hit and
-    tolerated via the previous ffmpeg-next VAAPI path. `Vp9Vaapi` stays
+    no encoder) — same VP9-hw-encode gap this project already hit and
+    tolerated via previous ffmpeg-next VAAPI path. `Vp9Vaapi` stays
     selectable (`ElementFactory::make` fails cleanly with `None` rather
-    than panicking) so the tolerant hardware-failure skip in
+    than panicking) so tolerant hardware-failure skip in
     `tests/integration.rs` still exercises that path.
   - **`hardware: bool`** is read only by `tests/integration.rs`'s
     tolerant-skip logic (hardware availability is environment/
@@ -226,8 +221,8 @@ same basis math in `dct_math.rs` → (GPU only) `shader.wgsl`.
   specifically so it can move into the `appsink` callback below, which
   GStreamer invokes from its own streaming thread) before building the
   pipeline. `PipelineMsg`'s shape (`Progress`/`Log`/`Done`/`Error` over a
-  `tokio::sync::mpsc::UnboundedSender`) is unchanged from the earlier
-  ffmpeg-next implementation — the whole point of this rewrite was to keep
+  `tokio::sync::mpsc::UnboundedSender`) is unchanged from earlier
+  ffmpeg-next implementation — whole point of this rewrite was to keep
   that outward contract identical so `ui/`, `main.rs`, and
   `tests/integration.rs` didn't have to change.
   - **Pipeline shape**: `filesrc ! decodebin`, whose `autoplug-continue`
@@ -339,8 +334,8 @@ same basis math in `dct_math.rs` → (GPU only) `shader.wgsl`.
     with `rayon` (`par_chunks_mut`) — each row is a disjoint read/write,
     no aliasing between them; unchanged in spirit from the ffmpeg-next
     version, just reading/writing `gst_video::VideoFrameRef` now.
-  - `PipelineMsg::Log` (→ the UI's in-app log panel) and `tracing::{info,
-    debug,warn,error}!` (→ stderr/whatever subscriber `main.rs` installs)
+  - `PipelineMsg::Log` (to UI's in-app log panel) and `tracing::{info,
+    debug,warn,error}!` (to stderr/whatever subscriber `main.rs` installs)
     fire at the same call sites deliberately — they're different audiences
     (end-user status vs. developer diagnostics), not a redundancy to clean
     up. GPU-test skip messages in `gpu.rs` stay on `eprintln!` rather than
@@ -414,8 +409,8 @@ same basis math in `dct_math.rs` → (GPU only) `shader.wgsl`.
 
 This repo has generated per-tool "caveman mode" rule files (`AGENTS.md`,
 `.cursor/rules/`, `.windsurf/rules/`, `.clinerules/`, `.github/copilot-instructions.md`)
-via `caveman-init`: terse, fragment-heavy responses in chat, no filler/
-pleasantries. The boundary that matters most: **code, commit messages, and
-PR descriptions are still written in normal, full prose** — the terse style
-applies to conversational responses only, not to anything persisted into the
-repo or git history.
+via `caveman-init`: terse, fragment-heavy responses in chat, no
+filler/pleasantries. Boundary that matters most: **code, commit messages,
+and PR descriptions still written in normal, full prose** — terse style
+applies to conversational responses only, not to anything persisted into
+the repo or git history.
