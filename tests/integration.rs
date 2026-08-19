@@ -313,6 +313,26 @@ fn encodes_with_every_selectable_encoder() {
     }
 }
 
+#[test]
+fn debug_real_file_probe() {
+    let input = std::path::Path::new("/home/admin/Videos/0000-0250.mkv");
+    let output = unique_path("debug_real_out.mp4");
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let out2 = output.clone();
+    let handle = std::thread::spawn(move || {
+        pipeline::run(input, &out2, 0.6, dctenc::encoders::EncoderChoice::H264, ComputeBackend::Gpu, tx)
+    });
+    while let Some(msg) = rx.blocking_recv() {
+        match msg {
+            PipelineMsg::Log(l) => eprintln!("LOG: {l}"),
+            PipelineMsg::Error(e) => eprintln!("ERROR: {e}"),
+            PipelineMsg::Done => eprintln!("DONE"),
+            PipelineMsg::Progress { current, total } => eprintln!("PROGRESS {current}/{total}"),
+        }
+    }
+    handle.join().unwrap();
+}
+
 /// Regression test for a real-world failure: some containers (this repros
 /// with a plain lavfi-generated pcm_s16le-in-mkv clip, same as e.g. some
 /// camera-recorded mkv files) don't record an explicit audio channel
