@@ -227,7 +227,7 @@ impl DctGpu {
     /// closest to DC, producing strong global ringing.
     pub fn process_plane(&self, pixels: &[f32], width: u32, height: u32, cutoff: f32) -> Result<Vec<f32>> {
         self.encode_plane(0, pixels, width, height, cutoff)?;
-        let rx = self.begin_read(0);
+        let rx = self.begin_read(0)?;
         self.device.poll(wgpu::PollType::wait_indefinitely()).context("gpu poll failed")?;
         self.finish_read(0, rx)
     }
@@ -249,9 +249,9 @@ impl DctGpu {
         self.encode_plane(0, r, width, height, cutoff)?;
         self.encode_plane(1, g, width, height, cutoff)?;
         self.encode_plane(2, b, width, height, cutoff)?;
-        let rx0 = self.begin_read(0);
-        let rx1 = self.begin_read(1);
-        let rx2 = self.begin_read(2);
+        let rx0 = self.begin_read(0)?;
+        let rx1 = self.begin_read(1)?;
+        let rx2 = self.begin_read(2)?;
         self.device.poll(wgpu::PollType::wait_indefinitely()).context("gpu poll failed")?;
         let r_out = self.finish_read(0, rx0)?;
         let g_out = self.finish_read(1, rx1)?;
@@ -319,7 +319,7 @@ impl DctGpu {
         }
 
         let cache = self.buffers[channel].borrow();
-        let buffers = cache.as_ref().unwrap();
+        let buffers = cache.as_ref().context("encode_plane: buffer cache missing after build/update")?;
 
         self.queue.write_buffer(&buffers.input_buf, 0, bytemuck::cast_slice(pixels));
 
@@ -369,15 +369,15 @@ impl DctGpu {
     /// `channel` after a `device.poll` — splitting the request from the wait
     /// is what lets `process_rgb` issue all three channels' map requests
     /// before blocking on any of them.
-    fn begin_read(&self, channel: usize) -> std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>> {
+    fn begin_read(&self, channel: usize) -> Result<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>> {
         let cache = self.buffers[channel].borrow();
-        let buffers = cache.as_ref().expect("encode_plane must be called before begin_read");
+        let buffers = cache.as_ref().context("begin_read: encode_plane must be called first")?;
         let slice = buffers.staging_buf.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
-        rx
+        Ok(rx)
     }
 
     /// Waits for `channel`'s `begin_read` map request (already driven by a
@@ -386,7 +386,7 @@ impl DctGpu {
         rx.recv().context("gpu map channel closed")??;
 
         let cache = self.buffers[channel].borrow();
-        let buffers = cache.as_ref().expect("encode_plane must be called before finish_read");
+        let buffers = cache.as_ref().context("finish_read: encode_plane must be called first")?;
         let slice = buffers.staging_buf.slice(..);
         let data = slice.get_mapped_range().context("failed to map gpu buffer")?;
         let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();

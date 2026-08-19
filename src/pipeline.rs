@@ -1,5 +1,5 @@
 use crate::gpu::DctGpu;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use ffmpeg_next as ff;
 use ff::format::Pixel;
 use ff::frame::Video as VideoFrame;
@@ -126,7 +126,7 @@ fn run_inner(input_path: &Path, output_path: &Path, cutoff: f32, tx: &Sender<Pip
         .index();
     let audio_stream_index = ictx.streams().best(MediaType::Audio).map(|s| s.index());
 
-    let stream = ictx.stream(video_stream_index).unwrap();
+    let stream = ictx.stream(video_stream_index).context("video stream disappeared after being located")?;
     let time_base = stream.time_base();
     let raw_frame_rate = stream.avg_frame_rate();
     // Fall back to a sane 30fps when the container doesn't report a usable
@@ -231,7 +231,7 @@ fn run_inner(input_path: &Path, output_path: &Path, cutoff: f32, tx: &Sender<Pip
 
     // audio: pure stream copy, no decode/re-encode.
     let audio_ost_index = if let Some(a_idx) = audio_stream_index {
-        let aist = ictx.stream(a_idx).unwrap();
+        let aist = ictx.stream(a_idx).context("audio input stream disappeared after being located")?;
         let mut aost = octx.add_stream(ff::encoder::find(ff::codec::Id::None))?;
         aost.set_parameters(aist.parameters());
         // Zero the copied codec_tag: it's valid in the input's container but
@@ -263,7 +263,7 @@ fn run_inner(input_path: &Path, output_path: &Path, cutoff: f32, tx: &Sender<Pip
     } else {
         octx.write_header()?;
     }
-    let ost_time_base = octx.stream(video_ost_index).unwrap().time_base();
+    let ost_time_base = octx.stream(video_ost_index).context("video output stream disappeared after being added")?.time_base();
 
     let mut from_rgb = Scaler::get(
         Pixel::RGB24,
@@ -287,8 +287,14 @@ fn run_inner(input_path: &Path, output_path: &Path, cutoff: f32, tx: &Sender<Pip
     //
     // `ictx`/`decoder` are only moved into the producer closure below, not
     // used again on this thread afterward.
-    let audio_in_time_base = audio_stream_index.map(|idx| ictx.stream(idx).unwrap().time_base());
-    let a_ost_time_base = audio_ost_index.map(|idx| octx.stream(idx).unwrap().time_base());
+    let audio_in_time_base = match audio_stream_index {
+        Some(idx) => Some(ictx.stream(idx).context("audio input stream disappeared after being located")?.time_base()),
+        None => None,
+    };
+    let a_ost_time_base = match audio_ost_index {
+        Some(idx) => Some(octx.stream(idx).context("audio output stream disappeared after being added")?.time_base()),
+        None => None,
+    };
 
     let (work_tx, work_rx) = std::sync::mpsc::sync_channel::<WorkItem>(2);
     let producer = std::thread::spawn(move || -> Result<()> {
