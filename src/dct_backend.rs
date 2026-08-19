@@ -5,8 +5,13 @@ use anyhow::{anyhow, Result};
 /// One whole-frame separable DCT-II compute implementation, chosen at
 /// runtime by `ComputeBackend`. `DctGpu` (wgpu compute) and `DctCpu` (plain
 /// Rust + rayon) both implement this so `pipeline.rs` can treat either
-/// uniformly after construction.
-pub trait DctBackend {
+/// uniformly after construction. `Send` is a supertrait (both impls
+/// already are: `DctGpu` holds a `wgpu::Device`/`Queue`, both `Send`;
+/// `DctCpu` holds a `RefCell`, `Send` since its contents are) so a
+/// `Box<dyn DctBackend>` can move into the GStreamer appsink callback,
+/// which runs on GStreamer's own streaming thread rather than the thread
+/// that constructed the pipeline.
+pub trait DctBackend: Send {
     fn process_rgb(
         &self,
         r: &[f32],

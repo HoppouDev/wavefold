@@ -1,14 +1,15 @@
-use crate::dct_backend::ComputeBackend;
-use crate::encoders::{EncoderChoice, HwAccel};
-use anyhow::{anyhow, bail, Context, Result};
-use ffmpeg_next as ff;
-use ff::format::Pixel;
-use ff::frame::Video as VideoFrame;
-use ff::media::Type as MediaType;
-use ff::software::scaling::{context::Context as Scaler, flag::Flags as ScaleFlags};
-use ff::Rescale;
+use crate::dct_backend::{ComputeBackend, DctBackend};
+use crate::encoders::EncoderChoice;
+use anyhow::{anyhow, Context, Result};
+use gstreamer as gst;
+use gstreamer::prelude::*;
+use gstreamer_app as gst_app;
+use gstreamer_video as gst_video;
+use gstreamer_video::prelude::*;
 use rayon::prelude::*;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedSender as Sender;
 use tracing::{debug, error, info, warn};
 
@@ -18,118 +19,6 @@ pub enum PipelineMsg {
     Log(String),
     Done,
     Error(String),
-}
-
-/// One unit of demuxed/decoded work handed from the decode stage to the GPU
-/// stage, preserving the original interleave order via the channel's FIFO
-/// delivery.
-enum WorkItem {
-    Video(VideoFrame),
-    Audio(ff::Packet),
-    Eof,
-    Error(String),
-}
-
-/// One unit of GPU-processed work handed from the GPU stage to the
-/// encode+mux stage. `Video` is already scaled into the encoder's pixel
-/// format and PTS-tagged — the encode stage only has to send it.
-enum EncodeItem {
-    Video(VideoFrame),
-    Audio(ff::Packet),
-    Eof,
-    Error(String),
-}
-
-/// Owns the VAAPI hw-frames-context buffer ref for the lifetime of the
-/// encode: per-frame `av_hwframe_get_buffer` calls (in `encode_hw_frame`)
-/// need it kept alive alongside the encoder itself, which is why this is
-/// held by the encode+mux stage rather than dropped right after setup.
-///
-/// SAFETY: `*mut AVBufferRef` is a plain heap-allocated refcounted handle
-/// with no thread-affinity of its own; moving ownership into the
-/// encode-stage thread (this type is only ever used from that one thread
-/// after construction, never shared/aliased across threads) is sound the
-/// same way `ffmpeg-next` itself asserts `Send` for `codec::context::
-/// Context`'s raw `AVCodecContext` pointer.
-struct HwFramesContext(*mut ff::sys::AVBufferRef);
-
-unsafe impl Send for HwFramesContext {}
-
-impl Drop for HwFramesContext {
-    fn drop(&mut self) {
-        unsafe { ff::sys::av_buffer_unref(&mut self.0) }
-    }
-}
-
-/// Creates a VAAPI hw device + hw frames context sized for `width`x`height`
-/// software frames in `sw_format`, and attaches it to `enc_ctx.hw_frames_ctx`
-/// — must run before the encoder is opened (`avcodec_open2` reads
-/// `hw_frames_ctx` during init for hardware encoders). Sequence follows
-/// FFmpeg's own `doc/examples/vaapi_encode.c`. `device` is left `NULL` in
-/// `av_hwdevice_ctx_create` so libva auto-selects the render node, rather
-/// than hardcoding e.g. `/dev/dri/renderD128`.
-fn setup_hw_frames_context(
-    enc_ctx: &mut ff::codec::encoder::video::Video,
-    hw: &HwAccel,
-    width: u32,
-    height: u32,
-    sw_format: Pixel,
-) -> Result<HwFramesContext> {
-    unsafe {
-        let mut hw_device_ctx: *mut ff::sys::AVBufferRef = std::ptr::null_mut();
-        let ret = ff::sys::av_hwdevice_ctx_create(
-            &mut hw_device_ctx,
-            hw.device_type,
-            std::ptr::null(),
-            std::ptr::null_mut(),
-            0,
-        );
-        if ret < 0 {
-            bail!("failed to create hw device context (no compatible GPU/driver available?): ffmpeg error {ret}");
-        }
-
-        let hw_frames_ref = ff::sys::av_hwframe_ctx_alloc(hw_device_ctx);
-        ff::sys::av_buffer_unref(&mut hw_device_ctx); // hw_frames_ref holds its own ref to the device now
-        if hw_frames_ref.is_null() {
-            bail!("failed to allocate hw frames context");
-        }
-
-        let frames_ctx = (*hw_frames_ref).data as *mut ff::sys::AVHWFramesContext;
-        (*frames_ctx).format = hw.encoder_pixel_format.into();
-        (*frames_ctx).sw_format = sw_format.into();
-        (*frames_ctx).width = width as i32;
-        (*frames_ctx).height = height as i32;
-        (*frames_ctx).initial_pool_size = 4;
-
-        let ret = ff::sys::av_hwframe_ctx_init(hw_frames_ref);
-        if ret < 0 {
-            let mut owned = hw_frames_ref;
-            ff::sys::av_buffer_unref(&mut owned);
-            bail!("failed to initialize hw frames context: ffmpeg error {ret}");
-        }
-
-        (*enc_ctx.as_mut_ptr()).hw_frames_ctx = ff::sys::av_buffer_ref(hw_frames_ref);
-
-        Ok(HwFramesContext(hw_frames_ref))
-    }
-}
-
-/// Uploads a software frame into a hw frame via the given context, copying
-/// over the PTS, ready to hand to `encoder.send_frame`.
-fn encode_hw_frame(hw_frames_ctx: &HwFramesContext, sw_frame: &VideoFrame) -> Result<VideoFrame> {
-    let mut hw_frame = VideoFrame::empty();
-    unsafe {
-        let ret = ff::sys::av_hwframe_get_buffer(hw_frames_ctx.0, hw_frame.as_mut_ptr(), 0);
-        if ret < 0 {
-            bail!("av_hwframe_get_buffer failed: ffmpeg error {ret}");
-        }
-        let ret = ff::sys::av_hwframe_transfer_data(hw_frame.as_mut_ptr(), sw_frame.as_ptr(), 0);
-        if ret < 0 {
-            bail!("av_hwframe_transfer_data failed: ffmpeg error {ret}");
-        }
-        (*hw_frame.as_mut_ptr()).pts = (*sw_frame.as_ptr()).pts;
-    }
-    Ok(hw_frame)
 }
 
 pub fn run(
@@ -146,45 +35,14 @@ pub fn run(
     }
 }
 
-/// True for the two libav return codes that mean "try again later" (need
-/// more input) or "flush complete" — both expected loop-ending conditions
-/// from `receive_frame`/`receive_packet`. Anything else is a real decode/
-/// encode failure and must not be swallowed.
-fn is_retry_or_eof(err: &ff::Error) -> bool {
-    matches!(err, ff::Error::Eof) || matches!(err, ff::Error::Other { errno } if *errno == ff::error::EAGAIN)
-}
-
-/// Drains all packets an encoder currently has buffered (or flushes on EOF)
-/// and writes them to the output container.
-fn drain_encoder(
-    encoder: &mut ff::encoder::Video,
-    octx: &mut ff::format::context::Output,
-    stream_index: usize,
-    ost_time_base: ff::Rational,
-) -> Result<()> {
-    let mut packet = ff::Packet::empty();
-    loop {
-        match encoder.receive_packet(&mut packet) {
-            Ok(()) => {
-                packet.set_stream(stream_index);
-                packet.rescale_ts(encoder.time_base(), ost_time_base);
-                packet.write_interleaved(octx)?;
-            }
-            Err(e) if is_retry_or_eof(&e) => break,
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Ok(())
-}
-
-/// Deinterleaves a packed RGB24 frame's plane 0 into three f32 planes,
+/// Deinterleaves a packed RGB frame's plane 0 into three f32 planes,
 /// respecting the frame's stride (linesize may exceed width*3). Rows are
 /// independent (disjoint reads of `data`, disjoint writes into r/g/b), so
 /// this is parallelized over rows with rayon.
-fn split_rgb_planes(frame: &VideoFrame, width: u32, height: u32) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    let (w, h) = (width as usize, height as usize);
-    let stride = frame.stride(0);
-    let data = frame.data(0);
+fn split_rgb_planes(frame: &gst_video::VideoFrameRef<&gst::BufferRef>) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let (w, h) = (frame.width() as usize, frame.height() as usize);
+    let stride = frame.plane_stride()[0] as usize;
+    let data = frame.plane_data(0).expect("RGB frame has no plane 0");
     let mut r = vec![0f32; w * h];
     let mut g = vec![0f32; w * h];
     let mut b = vec![0f32; w * h];
@@ -203,24 +61,94 @@ fn split_rgb_planes(frame: &VideoFrame, width: u32, height: u32) -> (Vec<f32>, V
     (r, g, b)
 }
 
-/// Reassembles three f32 planes back into a packed RGB24 frame, respecting
-/// the destination frame's own stride. Rows are independent, same
-/// rayon-over-rows treatment as `split_rgb_planes`.
-fn join_rgb_planes(width: u32, height: u32, r: &[f32], g: &[f32], b: &[f32]) -> VideoFrame {
-    let (w, h) = (width as usize, height as usize);
-    let mut frame = VideoFrame::new(Pixel::RGB24, width, height);
-    let stride = frame.stride(0);
-    let data = frame.data_mut(0);
-    data.par_chunks_mut(stride).take(h).enumerate().for_each(|(y, row)| {
-        for x in 0..w {
-            let i = y * w + x;
-            let o = x * 3;
-            row[o] = r[i].round().clamp(0.0, 255.0) as u8;
-            row[o + 1] = g[i].round().clamp(0.0, 255.0) as u8;
-            row[o + 2] = b[i].round().clamp(0.0, 255.0) as u8;
+/// Reassembles three f32 planes back into a packed RGB `gst::Buffer`,
+/// respecting the destination frame's own stride (via `VideoFrameRef`, so
+/// this stays correct regardless of any padding GStreamer negotiates).
+/// Rows are independent, same rayon-over-rows treatment as `split_rgb_planes`.
+fn join_rgb_planes(width: u32, height: u32, r: &[f32], g: &[f32], b: &[f32]) -> Result<gst::Buffer> {
+    let info = gst_video::VideoInfo::builder(gst_video::VideoFormat::Rgb, width, height)
+        .build()
+        .context("failed to build output VideoInfo")?;
+    let mut buffer = gst::Buffer::with_size(info.size()).context("failed to allocate output buffer")?;
+    {
+        let buffer_mut = buffer.get_mut().context("output buffer unexpectedly shared")?;
+        let mut frame = gst_video::VideoFrameRef::from_buffer_ref_writable(buffer_mut, &info)
+            .context("failed to map output frame writable")?;
+        let (w, h) = (width as usize, height as usize);
+        let stride = frame.plane_stride()[0] as usize;
+        let data = frame.plane_data_mut(0).context("output frame has no plane 0")?;
+        data.par_chunks_mut(stride).take(h).enumerate().for_each(|(y, row)| {
+            for x in 0..w {
+                let i = y * w + x;
+                let o = x * 3;
+                row[o] = r[i].round().clamp(0.0, 255.0) as u8;
+                row[o + 1] = g[i].round().clamp(0.0, 255.0) as u8;
+                row[o + 2] = b[i].round().clamp(0.0, 255.0) as u8;
+            }
+        });
+    }
+    Ok(buffer)
+}
+
+/// Runs the DCT backend over one decoded RGB sample and pushes the result
+/// into `appsrc`, copying the original buffer's PTS/DTS/duration across
+/// unchanged — GStreamer expresses timestamps in nanoseconds uniformly
+/// throughout the whole pipeline, so (unlike the old ffmpeg-next path)
+/// there is no timebase to rescale between.
+///
+/// NOTE: `appsink` redelivers its very first buffer twice — once via
+/// `new_preroll` (to complete the pipeline's PAUSED preroll) and once more
+/// via the first `new_sample` call after reaching PLAYING, both for the
+/// *same* buffer (confirmed empirically: both calls reported an identical
+/// PTS, while every subsequent `new_sample` call advanced normally) — so
+/// every one of `tests/integration.rs`'s exact-frame-count assertions was
+/// off by exactly one. `last_pts` dedups by skipping a call whose PTS
+/// matches the immediately preceding one.
+fn process_and_forward(
+    sample: &gst::Sample,
+    dct: &Mutex<Box<dyn DctBackend>>,
+    appsrc: &gst_app::AppSrc,
+    cutoff: f32,
+    frame_idx: &AtomicU64,
+    total_frames: u64,
+    tx: &Sender<PipelineMsg>,
+    last_pts: &Mutex<Option<gst::ClockTime>>,
+) -> Result<(), gst::FlowError> {
+    let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+    {
+        let mut last_pts = last_pts.lock().expect("last_pts mutex poisoned");
+        let pts = buffer.pts();
+        if pts.is_some() && *last_pts == pts {
+            return Ok(());
         }
-    });
-    frame
+        *last_pts = pts;
+    }
+    let caps = sample.caps().ok_or(gst::FlowError::Error)?;
+    let info = gst_video::VideoInfo::from_caps(caps).map_err(|_| gst::FlowError::Error)?;
+    let in_frame = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info).map_err(|_| gst::FlowError::Error)?;
+    let (width, height) = (in_frame.width(), in_frame.height());
+
+    let (r, g, b) = split_rgb_planes(&in_frame);
+    let (r2, g2, b2) = dct
+        .lock()
+        .expect("DCT backend mutex poisoned")
+        .process_rgb(&r, &g, &b, width, height, cutoff)
+        .map_err(|e| {
+            error!("DCT backend failed: {e:#}");
+            gst::FlowError::Error
+        })?;
+    let mut out_buffer = join_rgb_planes(width, height, &r2, &g2, &b2).map_err(|_| gst::FlowError::Error)?;
+    {
+        let out_buffer_mut = out_buffer.get_mut().ok_or(gst::FlowError::Error)?;
+        out_buffer_mut.set_pts(buffer.pts());
+        out_buffer_mut.set_dts(buffer.dts());
+        out_buffer_mut.set_duration(buffer.duration());
+    }
+
+    let current = frame_idx.fetch_add(1, Ordering::Relaxed) + 1;
+    let _ = tx.send(PipelineMsg::Progress { current, total: total_frames });
+
+    appsrc.push_buffer(out_buffer).map(|_| ()).map_err(|_| gst::FlowError::Error)
 }
 
 fn run_inner(
@@ -231,425 +159,378 @@ fn run_inner(
     backend: ComputeBackend,
     tx: &Sender<PipelineMsg>,
 ) -> Result<()> {
-    ff::init()?;
+    gst::init().context("failed to initialize GStreamer")?;
 
     info!(path = %input_path.display(), "opening input");
     let _ = tx.send(PipelineMsg::Log("opening input...".into()));
-    let mut ictx = ff::format::input(input_path)?;
 
-    let video_stream_index = ictx
-        .streams()
-        .best(MediaType::Video)
-        .ok_or_else(|| anyhow!("no video stream found in input"))?
-        .index();
-    let audio_stream_index = ictx.streams().best(MediaType::Audio).map(|s| s.index());
+    let input_str = input_path.to_str().context("input path is not valid UTF-8")?;
+    let output_str = output_path.to_str().context("output path is not valid UTF-8")?;
 
-    let stream = ictx.stream(video_stream_index).context("video stream disappeared after being located")?;
-    let time_base = stream.time_base();
-    let raw_frame_rate = stream.avg_frame_rate();
-    // Fall back to a sane 30fps when the container doesn't report a usable
-    // rate (0/0 is common for VFR sources, raw streams, incomplete
-    // metadata); used for both the logged fps and the encoder's time base
-    // /frame rate below, so a degenerate rate can't leak into either.
-    let frame_rate = if raw_frame_rate.denominator() != 0 && raw_frame_rate.numerator() != 0 {
-        raw_frame_rate
-    } else {
-        ff::Rational::new(30, 1)
-    };
-    let fps: f64 = frame_rate.numerator() as f64 / frame_rate.denominator() as f64;
-    let nb_frames = stream.frames().max(0) as u64;
-    let stream_duration_secs = if stream.duration() > 0 {
-        stream.duration() as f64 * f64::from(time_base)
-    } else {
-        0.0
-    };
-    // Matroska (and some other containers) commonly omit per-stream
-    // duration/frame-count metadata entirely — both legitimately
-    // unavailable, not just zero — even though the overall file duration
-    // is known (mkv stores it in the Segment Info, not per-track). Fall
-    // back to the format-level duration in that case so progress still
-    // shows a total instead of "unknown".
-    let duration_secs = if stream_duration_secs > 0.0 {
-        stream_duration_secs
-    } else if ictx.duration() > 0 {
-        ictx.duration() as f64 * f64::from(ff::rescale::TIME_BASE)
-    } else {
-        0.0
-    };
-    let total_frames = if nb_frames > 0 {
-        nb_frames
-    } else if duration_secs > 0.0 {
-        (duration_secs * fps).round() as u64
-    } else {
-        0
-    };
-
-    let context_decoder = ff::codec::context::Context::from_parameters(stream.parameters())?;
-    let mut decoder = context_decoder.decoder().video()?;
-    let width = decoder.width();
-    let height = decoder.height();
-    if width == 0 || height == 0 {
-        bail!("could not read video dimensions (unsupported file?)");
-    }
-
-    info!(width, height, fps, cutoff, "decoded input parameters");
-    let _ = tx.send(PipelineMsg::Log(format!(
-        "{width}x{height} @ {fps:.3} fps, cutoff={cutoff:.3}"
-    )));
-    // The whole-frame DCT is a naive O(width) / O(height) sum per output
-    // pixel (not a fast O(N log N) transform), so cost grows steeply with
-    // resolution — warn rather than let it look like a hang.
-    if (width as u64) * (height as u64) > 640 * 480 {
-        warn!(width, height, "resolution is large for a whole-frame DCT; expect this to be slow");
-        let _ = tx.send(PipelineMsg::Log(
-            "warning: this resolution is large for a whole-frame DCT (cost grows ~quadratically); expect this to be slow".into(),
-        ));
-    }
-    if audio_stream_index.is_some() {
-        debug!("audio stream found: will pass through unchanged");
-        let _ = tx.send(PipelineMsg::Log("audio stream found: will pass through unchanged".into()));
-    } else {
-        debug!("no audio stream found");
-        let _ = tx.send(PipelineMsg::Log("no audio stream found".into()));
-    }
     info!(?backend, "initializing DCT compute backend");
     let _ = tx.send(PipelineMsg::Log(format!("initializing {backend} DCT backend...")));
-    let dct = backend.build()?;
+    let dct: Arc<Mutex<Box<dyn DctBackend>>> = Arc::new(Mutex::new(backend.build()?));
 
-    let mut to_rgb = Scaler::get(
-        decoder.format(),
-        width,
-        height,
-        Pixel::RGB24,
-        width,
-        height,
-        ScaleFlags::BILINEAR,
-    )?;
-
-    let mut octx = ff::format::output(output_path)?;
     let profile = encoder_choice.profile();
-    let codec = ff::encoder::find_by_name(profile.codec_name)
-        .ok_or_else(|| anyhow!("encoder '{}' not available in this ffmpeg build", profile.codec_name))?;
-    debug!(codec = codec.name(), "video encoder selected");
+    debug!(element = profile.element_factory_name, "video encoder selected");
 
-    let enc_time_base = ff::Rational::new(frame_rate.denominator(), frame_rate.numerator().max(1));
+    let pipeline = gst::Pipeline::new();
 
-    let mut enc_ctx = ff::codec::context::Context::new_with_codec(codec).encoder().video()?;
-    enc_ctx.set_width(width);
-    enc_ctx.set_height(height);
-    enc_ctx.set_format(profile.hardware.as_ref().map_or(profile.sw_pixel_format, |hw| hw.encoder_pixel_format));
-    enc_ctx.set_time_base(enc_time_base);
-    enc_ctx.set_frame_rate(Some(frame_rate));
-    // No B-frames, applied uniformly regardless of which encoder was picked:
-    // frames are processed independently by the DCT pass anyway, and
-    // B-frame reordering was producing a negative initial DTS that the mp4
-    // muxer silently dropped on the first packet. AVCodecContext.max_b_frames
-    // must agree with the encoder-specific option below, or the mp4 muxer
-    // computes the wrong reorder delay and writes an edit list that
-    // silently trims frames.
-    enc_ctx.set_max_b_frames(0);
-    if octx.format().flags().contains(ff::format::Flags::GLOBAL_HEADER) {
-        enc_ctx.set_flags(ff::codec::Flags::GLOBAL_HEADER);
+    let filesrc = gst::ElementFactory::make("filesrc")
+        .property("location", input_str)
+        .build()
+        .context("failed to create filesrc")?;
+    let decodebin = gst::ElementFactory::make("decodebin").build().context("failed to create decodebin")?;
+    pipeline.add_many([&filesrc, &decodebin]).context("failed to add decode elements")?;
+    filesrc.link(&decodebin).context("failed to link filesrc -> decodebin")?;
+
+    // Encode side: appsrc (DCT'd frames pushed back in) -> videoconvert ->
+    // encoder -> queue -> muxer -> filesink. appsrc's caps (width/height/
+    // framerate) are set once the decoded video pad's caps are known, in
+    // `connect_pad_added` below — appsrc has no upstream to negotiate
+    // dimensions from, unlike appsink.
+    let appsrc = gst_app::AppSrc::builder().format(gst::Format::Time).build();
+    let venc_convert = gst::ElementFactory::make("videoconvert").build().context("failed to create videoconvert")?;
+    let encoder = gst::ElementFactory::make(profile.element_factory_name)
+        .build()
+        .with_context(|| format!("encoder '{}' not available in this GStreamer install", profile.element_factory_name))?;
+    for (key, value) in profile.properties {
+        encoder.set_property_from_str(key, value);
+    }
+    // Bitstream parser (h264parse/h265parse) between encoder and muxer —
+    // see `EncoderProfile::parser`'s doc comment for why this is needed.
+    let parser = profile
+        .parser
+        .map(|name| {
+            gst::ElementFactory::make(name)
+                .build()
+                .with_context(|| format!("parser '{name}' not available in this GStreamer install"))
+        })
+        .transpose()?;
+    let venc_queue = gst::ElementFactory::make("queue").build().context("failed to create encode queue")?;
+
+    // mp4/mov -> qtmux, everything else -> matroskamux, mirroring the old
+    // ffmpeg-next path's extension-based muxer choice.
+    let is_mp4_family = output_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("mp4") || e.eq_ignore_ascii_case("mov"))
+        .unwrap_or(false);
+    let muxer = gst::ElementFactory::make(if is_mp4_family { "qtmux" } else { "matroskamux" })
+        .build()
+        .context("failed to create muxer")?;
+    let filesink = gst::ElementFactory::make("filesink")
+        .property("location", output_str)
+        .build()
+        .context("failed to create filesink")?;
+
+    pipeline
+        .add_many([appsrc.upcast_ref::<gst::Element>(), &venc_convert, &encoder, &venc_queue, &muxer, &filesink])
+        .context("failed to add encode elements")?;
+    if let Some(p) = &parser {
+        pipeline.add(p).context("failed to add parser")?;
+    }
+    let mut encode_chain: Vec<&gst::Element> = vec![appsrc.upcast_ref::<gst::Element>(), &venc_convert, &encoder];
+    if let Some(p) = &parser {
+        encode_chain.push(p);
+    }
+    encode_chain.push(&venc_queue);
+    gst::Element::link_many(encode_chain).context("failed to link encode chain")?;
+    let mux_video_sink = muxer.request_pad_simple("video_%u").context("muxer has no video pad template")?;
+    venc_queue
+        .static_pad("src")
+        .context("encode queue has no src pad")?
+        .link(&mux_video_sink)
+        .context("failed to link encode queue -> muxer")?;
+    muxer.link(&filesink).context("failed to link muxer -> filesink")?;
+
+    // Audio passthrough queue: linked lazily once/if decodebin exposes a
+    // (still-encoded — see autoplug-continue below) audio pad. Not every
+    // input has an audio stream, so this may simply never get used.
+    let aud_queue = gst::ElementFactory::make("queue").build().context("failed to create audio queue")?;
+    // Decode-side conversion: whatever format the decoder outputs -> RGB,
+    // before frames reach appsink. Distinct from `venc_convert` above,
+    // which converts DCT'd RGB back to the encoder's format on the way out.
+    let dec_convert = gst::ElementFactory::make("videoconvert").build().context("failed to create decode-side videoconvert")?;
+    pipeline.add_many([&aud_queue, &dec_convert]).context("failed to add audio/decode-convert elements")?;
+
+    let appsink = gst_app::AppSink::builder()
+        .caps(&gst::Caps::builder("video/x-raw").field("format", "RGB").build())
+        .build();
+    pipeline.add(&appsink).context("failed to add appsink")?;
+    dec_convert.link(&appsink).context("failed to link videoconvert -> appsink")?;
+
+    let frame_idx = Arc::new(AtomicU64::new(0));
+    let total_frames = Arc::new(AtomicU64::new(0));
+    let last_pts: Arc<Mutex<Option<gst::ClockTime>>> = Arc::new(Mutex::new(None));
+    let fps_holder: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
+
+    // NOTE: appsink delivers its very first buffer via `new_preroll` (while
+    // the pipeline is still PAUSED) and every subsequent one via
+    // `new_sample` (once PLAYING) — both must forward into appsrc
+    // identically, or the video branch never gets its first buffer and the
+    // *whole pipeline's* PAUSED->PLAYING transition stalls forever (the
+    // muxer can't complete preroll on a starved pad). appsink's EOS is
+    // likewise not automatically forwarded to appsrc and must be done here
+    // explicitly, or the encode branch never learns decoding finished.
+    {
+        let dct_preroll = dct.clone();
+        let dct_sample = dct.clone();
+        let appsrc_preroll = appsrc.clone();
+        let appsrc_sample = appsrc.clone();
+        let appsrc_eos = appsrc.clone();
+        let frame_idx_preroll = frame_idx.clone();
+        let frame_idx_sample = frame_idx.clone();
+        let total_frames_preroll = total_frames.clone();
+        let total_frames_sample = total_frames.clone();
+        let tx_preroll = tx.clone();
+        let tx_sample = tx.clone();
+        let last_pts_preroll = last_pts.clone();
+        let last_pts_sample = last_pts.clone();
+        appsink.set_callbacks(
+            gst_app::AppSinkCallbacks::builder()
+                .new_preroll(move |sink| {
+                    let sample = sink.pull_preroll().map_err(|_| gst::FlowError::Eos)?;
+                    process_and_forward(
+                        &sample,
+                        &dct_preroll,
+                        &appsrc_preroll,
+                        cutoff,
+                        &frame_idx_preroll,
+                        total_frames_preroll.load(Ordering::Relaxed),
+                        &tx_preroll,
+                        &last_pts_preroll,
+                    )
+                    .map(|()| gst::FlowSuccess::Ok)
+                })
+                .new_sample(move |sink| {
+                    let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    process_and_forward(
+                        &sample,
+                        &dct_sample,
+                        &appsrc_sample,
+                        cutoff,
+                        &frame_idx_sample,
+                        total_frames_sample.load(Ordering::Relaxed),
+                        &tx_sample,
+                        &last_pts_sample,
+                    )
+                    .map(|()| gst::FlowSuccess::Ok)
+                })
+                .eos(move |_sink| {
+                    let _ = appsrc_eos.end_of_stream();
+                })
+                .build(),
+        );
     }
 
-    // Must happen before `open_as_with` below: `avcodec_open2` reads
-    // `hw_frames_ctx` during hardware-encoder init.
-    let hw_frames_ctx = match &profile.hardware {
-        Some(hw) => {
-            debug!(device_type = ?hw.device_type, "setting up hw frames context");
-            Some(setup_hw_frames_context(&mut enc_ctx, hw, width, height, profile.sw_pixel_format)?)
-        }
-        None => None,
-    };
-
-    let mut encoder_opts = ff::Dictionary::new();
-    for (key, value) in profile.options {
-        encoder_opts.set(key, value);
-    }
-    encoder_opts.set("bf", "0");
-
-    let mut encoder = enc_ctx.open_as_with(codec, encoder_opts)?;
-
-    let mut vost = octx.add_stream(codec)?;
-    vost.set_parameters(&encoder);
-    let video_ost_index = vost.index();
-    drop(vost);
-
-    // audio: pure stream copy, no decode/re-encode.
-    let audio_ost_index = if let Some(a_idx) = audio_stream_index {
-        let aist = ictx.stream(a_idx).context("audio input stream disappeared after being located")?;
-        let mut aost = octx.add_stream(ff::encoder::find(ff::codec::Id::None))?;
-        aost.set_parameters(aist.parameters());
-        unsafe {
-            let params = aost.parameters().as_mut_ptr();
-            // Zero the copied codec_tag: it's valid in the input's container
-            // but may not be recognized by the output muxer, causing strict
-            // players to misidentify or reject the passthrough track.
-            (*params).codec_tag = 0;
-            // Some containers (e.g. mkv from certain camera/phone encoders)
-            // don't record an explicit channel layout, leaving it
-            // AV_CHANNEL_ORDER_UNSPEC after a pure parameter copy. The mp4
-            // muxer can't write a channel-layout box for an unspecified
-            // layout and fails the whole encode with "unsupported channel
-            // layout N channels" — fill in the standard layout for that
-            // channel count (e.g. stereo for 2 channels) so passthrough
-            // into mp4 always has something the muxer can write.
-            if (*params).ch_layout.order == ff::sys::AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC {
-                ff::sys::av_channel_layout_default(&mut (*params).ch_layout, (*params).ch_layout.nb_channels);
-            }
-        }
-        Some(aost.index())
-    } else {
-        None
-    };
-
-    // Explicitly disable the mov muxer's auto edit-list: with an empty/auto
-    // edit list it was mis-computing the segment duration one frame short,
-    // causing players (including ffmpeg's own decoder) to silently drop the
-    // last encoded frame on playback. `use_editlist` is a mov/mp4-only,
-    // file-wide (not per-track) option, so only apply it when the resolved
-    // muxer is actually mov/mp4. Verified this must apply regardless of
-    // whether an audio track is present: leaving edit lists on "auto" for
-    // an audio+video mux still drops the last video frame the same way, so
-    // guaranteed video frame count wins over a possible audio-priming
-    // edit-list gap on the passed-through track.
-    let is_mp4_family = octx.format().name().split(',').any(|n| n == "mp4" || n == "mov");
-    if is_mp4_family {
-        let mut mov_opts = ff::Dictionary::new();
-        mov_opts.set("use_editlist", "0");
-        octx.write_header_with(mov_opts)?;
-    } else {
-        octx.write_header()?;
-    }
-    let ost_time_base = octx.stream(video_ost_index).context("video output stream disappeared after being added")?.time_base();
-
-    let mut from_rgb = Scaler::get(
-        Pixel::RGB24,
-        width,
-        height,
-        profile.sw_pixel_format,
-        width,
-        height,
-        ScaleFlags::BILINEAR,
-    )?;
-
-    // Three-stage pipeline — decode / GPU DCT / encode+mux — connected by
-    // two bounded channels, so each stage's work overlaps with the others
-    // instead of serializing on one thread (which is why the GPU previously
-    // sat idle during scale/encode, and the encoder sat idle during the GPU
-    // wait). Decode and encode+mux each get their own spawned thread below;
-    // *this* calling thread stays as the GPU stage in the middle, because
-    // `libswscale`'s `Context` (`to_rgb`/`from_rgb`) is not `Send` and so
-    // can never move into a spawned closure — `encoder`/`octx` (needed
-    // downstream) are `Send`, so it's the encode+mux stage that gets
-    // spawned off instead, not the GPU stage. Both channels' FIFO order
-    // preserves the original demux interleave for video and audio, so no
-    // separate reordering is needed.
-    //
-    // `ictx`/`decoder` are only moved into the decode-stage closure below;
-    // `encoder`/`octx` only into the encode-stage closure further down.
-    // Neither is used again on this (GPU-stage) thread afterward.
-    let audio_in_time_base = match audio_stream_index {
-        Some(idx) => Some(ictx.stream(idx).context("audio input stream disappeared after being located")?.time_base()),
-        None => None,
-    };
-    let a_ost_time_base = match audio_ost_index {
-        Some(idx) => Some(octx.stream(idx).context("audio output stream disappeared after being added")?.time_base()),
-        None => None,
-    };
-
-    let (work_tx, work_rx) = std::sync::mpsc::sync_channel::<WorkItem>(2);
-    let producer = std::thread::spawn(move || -> Result<()> {
-        let result = (|| -> Result<()> {
-            for (stream_in, mut packet) in ictx.packets() {
-                let in_index = stream_in.index();
-                if in_index == video_stream_index {
-                    decoder.send_packet(&packet)?;
-                    let mut decoded = VideoFrame::empty();
-                    loop {
-                        match decoder.receive_frame(&mut decoded) {
-                            Ok(()) => {
-                                if work_tx.send(WorkItem::Video(decoded)).is_err() {
-                                    return Ok(()); // consumer already stopped (errored)
-                                }
-                                decoded = VideoFrame::empty();
-                            }
-                            Err(e) if is_retry_or_eof(&e) => break,
-                            Err(e) => return Err(e.into()),
-                        }
-                    }
-                } else if Some(in_index) == audio_stream_index {
-                    if let (Some(a_ost_index), Some(in_tb), Some(out_tb)) =
-                        (audio_ost_index, audio_in_time_base, a_ost_time_base)
-                    {
-                        packet.rescale_ts(in_tb, out_tb);
-                        packet.set_stream(a_ost_index);
-                        if work_tx.send(WorkItem::Audio(packet)).is_err() {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-
-            decoder.send_eof()?;
-            let mut decoded = VideoFrame::empty();
-            loop {
-                match decoder.receive_frame(&mut decoded) {
-                    Ok(()) => {
-                        if work_tx.send(WorkItem::Video(decoded)).is_err() {
-                            return Ok(());
-                        }
-                        decoded = VideoFrame::empty();
-                    }
-                    Err(e) if is_retry_or_eof(&e) => break,
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            Ok(())
-        })();
-
-        match &result {
-            Ok(()) => {
-                let _ = work_tx.send(WorkItem::Eof);
-            }
-            Err(e) => {
-                let _ = work_tx.send(WorkItem::Error(format!("{e:#}")));
-            }
-        }
-        result
+    // decodebin decides whether to keep autoplugging based on this signal:
+    // false => stop and expose the pad as-is (passthrough), true => keep
+    // looking for a decoder. Video always continues (gets decoded); audio
+    // stops the moment it's no longer already raw, so it passes through to
+    // the muxer encoded — no decode/re-encode, matching the old
+    // ffmpeg-next path's pure stream-copy behavior.
+    decodebin.connect("autoplug-continue", false, |values| {
+        let caps = values[2].get::<gst::Caps>().expect("autoplug-continue arg 2 is not Caps");
+        let name = caps.structure(0).map(|s| s.name()).unwrap_or_default();
+        let should_continue = if name.starts_with("audio/") { name == "audio/x-raw" } else { true };
+        Some(should_continue.to_value())
     });
 
-    // Encode+mux stage runs on a *new* spawned thread instead of this one:
-    // `encoder`/`octx` are `Send` (unlike the `Scaler`s above), so they're
-    // what moves. This stage owns everything downstream of GPU processing —
-    // including the final `send_eof`/`write_trailer` — and reports the
-    // final frame count back through its `JoinHandle` once this (GPU-stage)
-    // thread joins it below.
-    let (encode_tx, encode_rx) = std::sync::mpsc::sync_channel::<EncodeItem>(2);
-    let encode_stage = std::thread::spawn(move || -> Result<i64> {
-        let mut frame_idx: i64 = 0;
-        loop {
-            match encode_rx.recv() {
-                Ok(EncodeItem::Video(yuv)) => {
-                    match &hw_frames_ctx {
-                        Some(hw) => {
-                            let hw_frame = encode_hw_frame(hw, &yuv)?;
-                            encoder.send_frame(&hw_frame)?;
+    let width_height_logged = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let appsrc_for_pad = appsrc.clone();
+        let dec_convert_for_pad = dec_convert.clone();
+        let aud_queue_for_pad = aud_queue.clone();
+        let muxer_for_pad = muxer.clone();
+        // NOTE: a *strong* clone of `pipeline` here would create a
+        // reference cycle — this closure is stored inside `decodebin`,
+        // which is a child element owned by `pipeline` itself, so
+        // `pipeline -> decodebin -> this closure -> pipeline` never drops.
+        // That leaked every `tx` clone held by any callback on any element
+        // in the pipeline, which meant the `PipelineMsg` channel never
+        // closed and every caller's `while let Some(msg) = rx.recv()` loop
+        // hung forever even after receiving `Done`/`Error` (confirmed: all
+        // 8 integration tests hung identically, regardless of whether the
+        // underlying encode would succeed or fail fast). A `WeakRef` breaks
+        // the cycle; `.upgrade()` is `None` once the pipeline is really gone.
+        let pipeline_weak = pipeline.downgrade();
+        let total_frames_for_pad = total_frames.clone();
+        let fps_holder_for_pad = fps_holder.clone();
+        let tx_for_pad = tx.clone();
+        let width_height_logged = width_height_logged.clone();
+
+        decodebin.connect_pad_added(move |_dbin, src_pad| {
+            let Some(caps) = src_pad.current_caps() else { return };
+            let Some(structure) = caps.structure(0) else { return };
+            let name = structure.name();
+
+            if name.starts_with("video/x-raw") {
+                let width: i32 = structure.get("width").unwrap_or(0);
+                let height: i32 = structure.get("height").unwrap_or(0);
+                let framerate: gst::Fraction = structure.get("framerate").unwrap_or(gst::Fraction::new(30, 1));
+
+                if !width_height_logged.swap(true, Ordering::Relaxed) {
+                    info!(width, height, "decoded input parameters");
+                    let fps = framerate.numer() as f64 / framerate.denom().max(1) as f64;
+                    let _ = tx_for_pad.send(PipelineMsg::Log(format!("{width}x{height} @ {fps:.3} fps, cutoff={cutoff:.3}")));
+                    if (width as u64) * (height as u64) > 640 * 480 {
+                        warn!(width, height, "resolution is large for a whole-frame DCT; expect this to be slow");
+                        let _ = tx_for_pad.send(PipelineMsg::Log(
+                            "warning: this resolution is large for a whole-frame DCT (cost grows ~quadratically); expect this to be slow".into(),
+                        ));
+                    }
+                    // Total-frame estimate for progress reporting: `fps` is
+                    // known now, but duration usually isn't yet (confirmed:
+                    // `query_duration` reliably returns `None` this early,
+                    // before the demuxer has parsed enough of the stream to
+                    // know it) — stash `fps` and let the main bus loop's
+                    // `DurationChanged` handler (the actual signal
+                    // demuxers use to announce this) do the query once it
+                    // fires. Stays at 0 ("unknown") if that never happens,
+                    // same tolerant fallback as before.
+                    *fps_holder_for_pad.lock().expect("fps_holder mutex poisoned") = Some(fps);
+                    if let Some(pipeline) = pipeline_weak.upgrade() {
+                        if let Some(dur) = pipeline.query_duration::<gst::ClockTime>() {
+                            let secs = dur.seconds() as f64 + (dur.nseconds() % 1_000_000_000) as f64 / 1e9;
+                            total_frames_for_pad.store((secs * fps).round() as u64, Ordering::Relaxed);
                         }
-                        None => encoder.send_frame(&yuv)?,
                     }
-                    drain_encoder(&mut encoder, &mut octx, video_ost_index, ost_time_base)?;
-                    frame_idx += 1;
                 }
-                Ok(EncodeItem::Audio(packet)) => {
-                    packet.write_interleaved(&mut octx)?;
+
+                appsrc_for_pad.set_caps(Some(
+                    &gst::Caps::builder("video/x-raw")
+                        .field("format", "RGB")
+                        .field("width", width)
+                        .field("height", height)
+                        .field("framerate", framerate)
+                        .build(),
+                ));
+
+                let sinkpad = dec_convert_for_pad.static_pad("sink").expect("videoconvert has no sink pad");
+                if let Err(e) = src_pad.link(&sinkpad) {
+                    error!("failed to link decoded video pad to videoconvert: {e:?}");
                 }
-                Ok(EncodeItem::Eof) => break,
-                Ok(EncodeItem::Error(msg)) => bail!("{msg}"),
-                Err(_) => bail!("GPU worker thread ended unexpectedly"),
+            } else if name.starts_with("audio/") {
+                debug!("audio stream found: will pass through unchanged");
+                let sinkpad = aud_queue_for_pad.static_pad("sink").expect("audio queue has no sink pad");
+                if sinkpad.is_linked() {
+                    return;
+                }
+                if let Err(e) = src_pad.link(&sinkpad) {
+                    error!("failed to link passthrough audio pad to queue: {e:?}");
+                    return;
+                }
+                let Some(mux_audio_sink) = muxer_for_pad.request_pad_simple("audio_%u") else {
+                    error!("muxer has no audio pad template");
+                    return;
+                };
+                let q_src = aud_queue_for_pad.static_pad("src").expect("audio queue has no src pad");
+                if let Err(e) = q_src.link(&mux_audio_sink) {
+                    error!("failed to link audio queue to muxer: {e:?}");
+                }
             }
-        }
-        encoder.send_eof()?;
-        drain_encoder(&mut encoder, &mut octx, video_ost_index, ost_time_base)?;
-        octx.write_trailer()?;
-        Ok(frame_idx)
-    });
-
-    // GPU stage: this (calling) thread. Scale to RGB24, run the GPU DCT,
-    // reassemble, scale to the encoder's pixel format, tag the PTS — stays
-    // here (rather than moving to a spawned thread) specifically because
-    // `to_rgb`/`from_rgb`/`gpu` can't cross a thread boundary.
-    let mut frame_idx: i64 = 0;
-    let gpu_result = (|| -> Result<()> {
-        loop {
-            match work_rx.recv() {
-                Ok(WorkItem::Video(decoded)) => {
-                    let mut rgb = VideoFrame::empty();
-                    to_rgb.run(&decoded, &mut rgb)?;
-
-                    let (r, g, b) = split_rgb_planes(&rgb, width, height);
-                    let (r2, g2, b2) = dct.process_rgb(&r, &g, &b, width, height, cutoff)?;
-                    let rgb_out = join_rgb_planes(width, height, &r2, &g2, &b2);
-
-                    let mut yuv = VideoFrame::empty();
-                    from_rgb.run(&rgb_out, &mut yuv)?;
-                    // Keep the decoded frame's own timeline (rescaled into
-                    // the encoder's time base) instead of a synthetic
-                    // zero-based counter, so video stays aligned with the
-                    // audio passthrough's original timestamps (e.g. inputs
-                    // with a nonzero stream start_time). `frame_idx` is
-                    // only a fallback for frames with no pts, and is
-                    // already expressed directly in enc_time_base units (1
-                    // tick = 1 frame), so unlike a real pts it must NOT be
-                    // rescaled from the input's time_base.
-                    let source_pts = match decoded.pts() {
-                        Some(pts) => pts.rescale(time_base, enc_time_base),
-                        None => frame_idx,
-                    };
-                    yuv.set_pts(Some(source_pts));
-                    frame_idx += 1;
-
-                    let _ = tx.send(PipelineMsg::Progress { current: frame_idx as u64, total: total_frames });
-
-                    if encode_tx.send(EncodeItem::Video(yuv)).is_err() {
-                        return Ok(()); // encode stage already stopped (errored)
-                    }
-                }
-                Ok(WorkItem::Audio(packet)) => {
-                    if encode_tx.send(EncodeItem::Audio(packet)).is_err() {
-                        return Ok(());
-                    }
-                }
-                Ok(WorkItem::Eof) => return Ok(()),
-                Ok(WorkItem::Error(msg)) => bail!("{msg}"),
-                Err(_) => bail!("decode worker thread ended unexpectedly"),
-            }
-        }
-    })();
-
-    match &gpu_result {
-        Ok(()) => {
-            let _ = encode_tx.send(EncodeItem::Eof);
-        }
-        Err(e) => {
-            let _ = encode_tx.send(EncodeItem::Error(format!("{e:#}")));
-        }
+        });
     }
 
-    // Reaching here means `encode_stage` finished cleanly (it only ever
-    // receives `EncodeItem::Eof`, never `Error`, when `gpu_result` is
-    // `Ok`), so `gpu_result` is already known-`Ok` — nothing left to check.
-    let final_frame_count = match encode_stage.join() {
-        Ok(Ok(n)) => n,
-        Ok(Err(e)) => return Err(e),
-        Err(_) => bail!("encode worker thread panicked"),
-    };
-    match producer.join() {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(e),
-        Err(_) => bail!("decode worker thread panicked"),
+    if !width_height_logged.load(Ordering::Relaxed) {
+        debug!("no audio stream found (or none yet) at pipeline construction time");
     }
 
+    // NOTE: `pipeline.set_state(Null)` must run on *every* exit path, not
+    // just the success one — dropping a `gst::Pipeline` that was never
+    // cleanly transitioned to `Null` can itself hang during teardown
+    // (GStreamer's internal dispose logic forcing a state change while
+    // finalizing), which previously meant a `set_state(Playing)` failure
+    // (e.g. missing input file) left the pipeline — and everything it
+    // owns, including every `tx` clone held by the callbacks registered
+    // above — stuck forever, so the channel never closed and callers'
+    // `while let Some(msg) = rx.recv()` loops hung even after already
+    // receiving the `Error` message. So: collect the Playing-transition
+    // result instead of using `?` on it directly, always attempt the Null
+    // transition afterward, and only propagate whichever error mattered.
+    let mut final_error: Option<anyhow::Error> = None;
+    if let Err(e) = pipeline.set_state(gst::State::Playing) {
+        final_error = Some(anyhow!("failed to set pipeline to Playing: {e}"));
+    } else {
+        // One more best-effort duration query, blocking until the async
+        // Paused->Playing transition truly completes first: `DurationChanged`
+        // isn't reliably posted for every demuxer/container combination
+        // (confirmed: never fired for either an mp4 or an mkv test fixture
+        // here), but by the time the state change genuinely finishes the
+        // demuxer has necessarily parsed far enough to have exposed pads
+        // (`fps_holder` set) and, in practice, to answer a duration query.
+        let _ = pipeline.state(gst::ClockTime::from_seconds(5));
+        if total_frames.load(Ordering::Relaxed) == 0 {
+            if let Some(fps) = *fps_holder.lock().expect("fps_holder mutex poisoned") {
+                if let Some(dur) = pipeline.query_duration::<gst::ClockTime>() {
+                    let secs = dur.seconds() as f64 + (dur.nseconds() % 1_000_000_000) as f64 / 1e9;
+                    total_frames.store((secs * fps).round() as u64, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let bus = pipeline.bus().context("pipeline has no bus")?;
+        for msg in bus.iter_timed(gst::ClockTime::NONE) {
+            use gst::MessageView;
+            match msg.view() {
+                MessageView::Eos(_) => break,
+                MessageView::Error(err) => {
+                    final_error = Some(anyhow!(
+                        "pipeline error from {}: {} ({:?})",
+                        err.src().map(|s| s.path_string().to_string()).unwrap_or_default(),
+                        err.error(),
+                        err.debug()
+                    ));
+                    break;
+                }
+                // The actual signal demuxers use to announce a
+                // newly-known duration (see the pad-added handler above,
+                // where an immediate `query_duration` reliably returns
+                // `None` — too early in the PAUSED transition).
+                MessageView::DurationChanged(_) => {
+                    if let Some(fps) = *fps_holder.lock().expect("fps_holder mutex poisoned") {
+                        if let Some(dur) = pipeline.query_duration::<gst::ClockTime>() {
+                            let secs = dur.seconds() as f64 + (dur.nseconds() % 1_000_000_000) as f64 / 1e9;
+                            total_frames.store((secs * fps).round() as u64, Ordering::Relaxed);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let _ = pipeline.set_state(gst::State::Null);
+
+    if let Some(e) = final_error {
+        // `filesink` opens (and thus creates/truncates) its output file as
+        // part of the pipeline's state transition, independent of whether
+        // upstream (e.g. `filesrc` on a missing input) ever actually
+        // succeeds — so a failed encode can still leave a zero-byte output
+        // file behind unless it's cleaned up here.
+        let _ = std::fs::remove_file(output_path);
+        return Err(e);
+    }
+
+    let final_frame_count = frame_idx.load(Ordering::Relaxed);
     info!(frames = final_frame_count, path = %output_path.display(), "encode complete");
-    let _ = tx.send(PipelineMsg::Log(format!(
-        "wrote {} frames to {}",
-        final_frame_count,
-        output_path.display()
-    )));
+    let _ = tx.send(PipelineMsg::Log(format!("wrote {final_frame_count} frames to {}", output_path.display())));
     let _ = tx.send(PipelineMsg::Done);
     Ok(())
 }
 
-// Fixture-generating tests (spawning ffmpeg to build a synthetic clip, then
-// running the pipeline against it) live in tests/integration.rs so there's
-// one shared copy of that helper instead of two drifting implementations.
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn errors_on_missing_input() {
-        let result = ff::format::input(Path::new("/nonexistent/dctenc_test_input.mp4"));
+        let result = super::run_inner(
+            std::path::Path::new("/nonexistent/dctenc_test_input.mp4"),
+            std::path::Path::new("/tmp/dctenc_test_output_never_created.mp4"),
+            0.6,
+            crate::encoders::EncoderChoice::H264,
+            crate::dct_backend::ComputeBackend::Cpu,
+            &tokio::sync::mpsc::unbounded_channel().0,
+        );
         assert!(result.is_err());
     }
 }

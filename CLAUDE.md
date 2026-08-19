@@ -8,10 +8,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 a `clap` subcommand) that applies a whole-frame DCT "distortion" effect to
 video: decode → per-frame DCT compress/reconstruct on a user-selectable
 compute backend (GPU via wgpu, or a pure-CPU fallback) → re-encode with a
-user-selectable encoder — software (libx264/libx265/libvpx-vp9/libaom-av1)
+user-selectable encoder — software (x264/x265/vp9/av1 GStreamer elements)
 or VAAPI hardware — with audio passed through untouched. This is a visual
 effect tool, not a real codec — the point is the ringing/ghosting artifact
 the DCT cutoff produces, not compression efficiency.
+
+Media I/O (`pipeline.rs`/`encoders.rs`) is built on **GStreamer**
+(`gstreamer`/`gstreamer-app`/`gstreamer-video`), not FFmpeg — this replaced
+an earlier `ffmpeg-next`-based implementation specifically because
+`ffmpeg-sys-next` declares `links = "ffmpeg"`, and Cargo hard-bans two
+versions of a `links`-crate coexisting in one dependency graph, which made
+it structurally impossible for one `Cargo.toml` to build against both this
+dev machine's FFmpeg (Arch, rolling) and a stock Ubuntu CI runner's older
+one at the same time. GStreamer's C API/ABI has been stable since 1.0
+(2012), so one `gstreamer` crate version builds against a wide range of
+installed GStreamer versions without that problem.
 
 ## Commands
 
@@ -34,11 +45,10 @@ backend needs no GPU at all. `tests/integration.rs` shells out to the
 `ffmpeg` CLI (not `ffmpeg-next`) purely to generate synthetic test-fixture
 clips; it also skips gracefully if `ffmpeg` isn't on `PATH`.
 
-`.github/workflows/ci.yml` runs `dctenc encode --backend cpu` inside an
-Arch Linux container on a standard (GPU-less) `ubuntu-latest` runner — see
-the workflow file's comments for why Arch specifically (this repo's pinned
-`ffmpeg-next` major version needs to match the installed FFmpeg's, and
-Ubuntu's packaged FFmpeg is far behind what's pinned here).
+`.github/workflows/ci.yml` runs `dctenc encode --backend cpu` on a plain
+`ubuntu-latest` runner (no container workaround needed — see the "What this
+is" section above for why the GStreamer rewrite is specifically what made
+that possible).
 
 `RUST_LOG=debug cargo run --release` (or any `tracing`-compatible env filter)
 surfaces the `tracing` diagnostics described below — the app has no other
@@ -49,33 +59,39 @@ their defaults if needed.
 
 ### System dependencies
 
-`ffmpeg-next`/`ffmpeg-sys-next` bind against the system's libavcodec/
-libavformat/etc. via `pkg-config` and generate bindings with `bindgen`
-against the installed headers — **the crate's major version must match the
-installed FFmpeg's major version** (this repo pins `ffmpeg-next = "9"` to
-match FFmpeg 9 headers; an older/newer system FFmpeg will need the
-dependency version bumped to match, or the build fails during bindgen, e.g.
-on a missing/renamed header). `pkg-config`, FFmpeg dev headers, and the
-encoder libraries actually available on the system (libx264/libx265/
-libvpx/libaom — see `src/encoders.rs`) must be installed and discoverable
-for a from-scratch build; an `EncoderChoice` whose libav encoder isn't
-present in the local FFmpeg build fails at encode time with a clear error,
-not at compile time. The `*Vaapi` variants additionally need a VAAPI-capable
-GPU/driver (`libva`, a `/dev/dri/renderD*` node) at *runtime* — there's no
-build-time dependency on VAAPI since `pipeline.rs` drives it through raw FFI
-against symbols FFmpeg's headers already provide, not a separate crate;
-`av_hwdevice_ctx_create` failing (no compatible device) surfaces as a normal
-pipeline error, not a build failure.
+`gstreamer-sys`/`gstreamer-app-sys`/`gstreamer-video-sys` bind against the
+system's libgstreamer-1.0/libgstapp-1.0/libgstvideo-1.0 via `pkg-config` —
+unlike the old ffmpeg-next setup, there's no major-version-must-match
+constraint (GStreamer's C ABI has been stable since 1.0), so any reasonably
+current GStreamer dev install works. For a from-scratch build you need:
+`pkg-config`, `libgstreamer1.0-dev`, `libgstreamer-plugins-base1.0-dev`
+(Debian/Ubuntu naming; `gstreamer`/`gst-plugins-base` on Arch) for the
+headers, **plus the actual plugins at runtime** — `gst-plugins-good`
+(`vp9enc`), `gst-plugins-bad` (`x265enc`, `av1enc`, the `va` VAAPI plugin),
+`gst-plugins-ugly` (`x264enc`) — an `EncoderChoice` whose element isn't
+installed fails at pipeline-construction time with a clear error (`gst::
+ElementFactory::make` returning `None`), not at compile time. Also install
+`gstreamer1.0-libav` (or your distro's equivalent) for broad-codec
+*decoding* — this repo's own dev/CI environment needed it because the
+default `openh264dec` decoder can't handle every H.264 profile FFmpeg
+itself can produce (see `pipeline.rs`'s decode-side notes below). The
+`va`-plugin VAAPI elements (`vah264enc`/`vah265enc`/`vaav1enc`) additionally
+need a VAAPI-capable GPU/driver (`libva`, a `/dev/dri/renderD*` node) at
+*runtime* to even register as available element factories — with no such
+device, `gst_inspect_1.0 va` still loads the plugin but the individual
+codec elements just don't exist, so `ElementFactory::make("vah264enc")`
+fails the same clean way as a genuinely-uninstalled plugin, not a build
+failure.
 
 ## Architecture
 
 Pipeline, one direction: `main.rs` (clap entry point, dispatches to the iced
 GUI or a headless encode) → `ui/` (setup/encoding pages, GUI path only) →
-`pipeline.rs` (decode/encode orchestration via ffmpeg-next, using
-`encoders.rs` for the chosen output codec) → `dct_backend.rs`'s
-`ComputeBackend` (GPU or CPU) → `gpu.rs` (wgpu compute) / `cpu.rs` (plain
-Rust + rayon), both driven by the same basis math in `dct_math.rs` → (GPU
-only) `shader.wgsl`.
+`pipeline.rs` (a `gst::Pipeline` built and driven via `gstreamer`/
+`gstreamer-app`/`gstreamer-video`, using `encoders.rs` for the chosen output
+codec's element) → `dct_backend.rs`'s `ComputeBackend` (GPU or CPU) →
+`gpu.rs` (wgpu compute) / `cpu.rs` (plain Rust + rayon), both driven by the
+same basis math in `dct_math.rs` → (GPU only) `shader.wgsl`.
 
 - **`src/lib.rs`** re-exports `pub mod cpu; pub mod dct_backend; mod
   dct_math; pub mod encoders; pub mod gpu; pub mod pipeline;` so both the
@@ -161,101 +177,168 @@ only) `shader.wgsl`.
 
 - **`src/encoders.rs`** — `EncoderChoice` (8 variants: H264/H265/Vp9/Av1,
   each with a `*Vaapi` hardware counterpart) and its `profile()` →
-  `EncoderProfile { codec_name, sw_pixel_format, options, hardware }`:
-  the libav encoder name for `ff::encoder::find_by_name` (not a codec-ID
-  lookup — several of these codecs have more than one libav encoder), the
-  pixel format frames are scaled into before encoding, that encoder's own
-  dictionary options, and (for the `*Vaapi` variants) `Some(HwAccel {
-  device_type, encoder_pixel_format })`. Different encoders take different
-  option keys (`preset` for x264/x265; `deadline`+`cpu-used` for
-  libvpx-vp9; `cpu-used` for libaom-av1; no options at all for the VAAPI
-  variants) — this isn't a codec-ID swap. `bf=0` (the mp4 edit-list
-  workaround, see `pipeline.rs` below) is applied uniformly in
-  `pipeline.rs` regardless of which encoder is chosen, rather than
-  special-cased per encoder; `avcodec_open2` silently ignores dictionary
-  keys an encoder doesn't recognize, so this is harmless for encoders
-  without B-frames. `sw_pixel_format` vs `HwAccel::encoder_pixel_format`
-  are deliberately separate fields: for a hardware encoder, frames are
-  scaled to a real software format (`Pixel::NV12`) and then *uploaded* to
-  a hw-accel pixel format (`Pixel::VAAPI`) — see `pipeline.rs`.
+  `EncoderProfile { element_factory_name, properties, parser, hardware }`:
+  the GStreamer element factory name for `gst::ElementFactory::make` (not a
+  codec-ID lookup — several of these codecs have more than one GStreamer
+  encoder element), that element's own properties (set via
+  `set_property_from_str`, which type-coerces from a plain string
+  regardless of whether the property is itself a string, enum, or
+  integer), and an optional bitstream parser element name. Different
+  encoders take entirely different property sets — `tune=zerolatency` for
+  x264/x265; `deadline`+`lag-in-frames` for vp9; `cpu-used`+
+  `lag-in-frames` for av1; no properties for the VAAPI variants — this
+  isn't a codec-ID swap.
+  - **Every software encoder needs its internal lookahead/B-frame
+    buffering disabled** (frame-in, frame-out), or it can fail to emit a
+    first output packet fast enough for the muxer (a `GstAggregator`) to
+    complete preroll on that pad — which stalls the **whole pipeline's**
+    `Paused`->`Playing` transition forever, not just that one branch
+    (`appsink` only ever delivers its one preroll buffer while stuck in
+    `Paused`; confirmed by reproducing this exact hang with `x264enc`'s
+    defaults). The fix differs per encoder (`tune=zerolatency` for x264/
+    x265; `lag-in-frames=0` for vp9/av1) so each is set explicitly rather
+    than assumed to share x264's property names. VAAPI encoders don't need
+    this: `b-frames` already defaults to `0`.
+  - **`parser: Option<&'static str>`** (`h264parse`/`h265parse`) is
+    inserted between the encoder and the muxer's request pad — standard
+    GStreamer practice, and *required* in practice for H.265: `x265enc`'s
+    raw output caps don't have a format `qtmux`/`matroskamux`'s video pad
+    template accepts directly (fails with "Pads do not have common
+    format" otherwise, confirmed). `h264parse` is inserted uniformly too
+    even though `x264enc` happened to link without one — cheap insurance
+    against the same class of failure on a muxer/version this wasn't
+    tested against. VP9/AV1 need no parser.
+  - **No `vavp9enc` exists** in GStreamer's `va` plugin (confirmed against
+    this machine's real AMD/Mesa VAAPI driver: only `vavp9dec` registers,
+    no encoder) — the same VP9-hw-encode gap this project already hit and
+    tolerated via the previous ffmpeg-next VAAPI path. `Vp9Vaapi` stays
+    selectable (`ElementFactory::make` fails cleanly with `None` rather
+    than panicking) so the tolerant hardware-failure skip in
+    `tests/integration.rs` still exercises that path.
+  - **`hardware: bool`** is read only by `tests/integration.rs`'s
+    tolerant-skip logic (hardware availability is environment/
+    driver-dependent) — `pipeline.rs` itself doesn't need to know.
 
-- **`src/pipeline.rs`** — all ffmpeg-next work, split across **three**
-  threads (decode / GPU DCT / encode+mux) so each stage's work overlaps
-  the others instead of serializing on one thread. Audio is a pure stream
-  copy (no decode/re-encode), remuxed by rescaling packet timestamps into
-  the output's time base. A few non-obvious things worth knowing before
-  editing this file:
-  - **Three-stage pipeline**: a decode thread demuxes+decodes, sending
-    `WorkItem::{Video(VideoFrame), Audio(Packet), Eof, Error(String)}`
-    down a bounded `std::sync::mpsc::sync_channel(2)`. The GPU stage
-    (scale→GPU DCT→reassemble→scale, PTS tagging, progress reporting)
-    stays on `run_inner`'s own calling thread — **not** a spawned one —
-    and forwards `EncodeItem::{Video(VideoFrame), Audio(Packet), Eof,
-    Error(String)}` down a second channel to a *spawned* encode+mux
-    thread, which owns `send_frame`/mux-write and the final
-    `send_eof`/`write_trailer`, returning the final frame count through
-    its `JoinHandle`. **Which stage is "the calling thread" vs "spawned"
-    is dictated by `Send`, not by pipeline order**: `libswscale`'s
-    `Scaler` (`software::scaling::context::Context`) is not `Send` (a raw
-    `SwsContext` pointer, no `unsafe impl Send`) and so can *never* move
-    into a newly spawned thread — that's why the GPU stage (the one
-    holding the two `Scaler`s) is the thread that already exists rather
-    than one that gets spawned, while `encoder`/`octx` (both confirmed
-    `Send` via ffmpeg-next's `unsafe impl Send for Context`/`for Output`)
-    are what moves into the new encode-stage thread instead. Don't
-    "simplify" this by trying to spawn a GPU-stage thread and keep
-    encode+mux on the caller — that's exactly the arrangement `Send`
-    rules out. This three-way split is what fixed "100% CPU, 65% GPU"
-    (an earlier two-thread version already overlapped decode with
-    GPU+encode; this went further and overlaps GPU-DCT-of-frame-N+1 with
-    encode-of-frame-N too).
-  - **VAAPI hardware encoding** (`EncoderChoice::*Vaapi`): `ffmpeg-next`
-    has no safe wrapper for hwdevice/hwframe APIs at all, so
-    `setup_hw_frames_context`/`encode_hw_frame` in `pipeline.rs` drive
-    them directly through `ff::sys` (raw FFI) — `av_hwdevice_ctx_create`
-    (device=`NULL`, so libva auto-picks the render node) →
-    `av_hwframe_ctx_alloc` → set `format`/`sw_format`/`width`/`height`/
-    `initial_pool_size` on the `AVHWFramesContext` → `av_hwframe_ctx_init`
-    → attach to `AVCodecContext.hw_frames_ctx` **before** opening the
-    encoder (`avcodec_open2` reads it during init). Per frame:
-    `av_hwframe_get_buffer` + `av_hwframe_transfer_data` upload the
-    GPU-stage's software (NV12) frame into a hw frame before
-    `send_frame`. The owning `HwFramesContext` (a thin RAII wrapper
-    around the `*mut AVBufferRef`, `av_buffer_unref`'d on `Drop`) is
-    created during setup on the GPU-stage thread but *used* on the
-    encode-stage thread (per-frame `av_hwframe_get_buffer` calls need it
-    alive there) — moving a raw pointer across that thread boundary needs
-    its own `unsafe impl Send`, justified the same way ffmpeg-next
-    justifies its own: the pointer is a plain refcounted heap handle with
-    no thread affinity, and ownership fully transfers (never aliased
-    across threads). Hardware encoder support is inherently
-    environment/driver-dependent — e.g. on this dev system's AMD/Mesa
-    VAAPI driver, H.264/HEVC/AV1 hw encode all work but VP9 hw encode
-    fails with "no usable encoding entrypoint" (the driver just doesn't
-    expose that capability) — `av_hwdevice_ctx_create` failure and
-    encoder-open failure both surface as ordinary `anyhow` errors through
-    the normal `PipelineMsg::Error` path, never a panic.
-  - The mov/mp4 muxer's auto edit-list logic silently drops the last encoded
-    video frame under some conditions; `write_header_with` passes
-    `use_editlist=0` for mp4-family outputs to avoid that. That's an
-    empirically-discovered fix, not something libav documents cleanly.
-  - `decoder.receive_frame` / `encoder.receive_packet` loops must
-    distinguish "no more output yet" (`Error::Eof` / `Error::Other{EAGAIN}`)
-    from a real decode/encode error — treating any `Err` as "done" silently
-    drops frames on genuine failures.
-  - Video PTS comes from the decoded frame's own timestamp (rescaled into
-    the encoder's time base), not a synthetic zero-based counter, so it
-    stays aligned with the audio passthrough's original timeline.
+- **`src/pipeline.rs`** — builds and drives one `gst::Pipeline` per encode.
+  `run`/`run_inner` take a `backend: ComputeBackend` parameter (alongside
+  `encoder_choice`); `run_inner` resolves it once via `backend.build()?`
+  into a `Box<dyn DctBackend>` (the trait has `Send` as a supertrait
+  specifically so it can move into the `appsink` callback below, which
+  GStreamer invokes from its own streaming thread) before building the
+  pipeline. `PipelineMsg`'s shape (`Progress`/`Log`/`Done`/`Error` over a
+  `tokio::sync::mpsc::UnboundedSender`) is unchanged from the earlier
+  ffmpeg-next implementation — the whole point of this rewrite was to keep
+  that outward contract identical so `ui/`, `main.rs`, and
+  `tests/integration.rs` didn't have to change.
+  - **Pipeline shape**: `filesrc ! decodebin`, whose `autoplug-continue`
+    signal is told to keep decoding video (`true`) but stop the moment
+    audio caps are no longer already `audio/x-raw` (`false`) — this is
+    what makes audio a pure passthrough (no decode/re-encode) without a
+    manual demux/remux step: `decodebin` just exposes the still-encoded
+    pad directly instead of auto-plugging a decoder for it. The video pad
+    goes `videoconvert ! appsink` (forced to `video/x-raw,format=RGB`);
+    the DCT step runs inside `appsink`'s callbacks (see below), pushing
+    into `appsrc ! videoconvert ! <encoder> ! [<parser> !] queue !
+    <muxer>`. The audio pad (once linked) goes straight `queue !
+    <muxer>`, no decode/encode element in between. No manual worker
+    threads or channels are needed for overlap the way the old
+    three-thread ffmpeg-next design required — GStreamer's own `queue`
+    elements provide that buffering/overlap for free; `queue` elements
+    exist in this graph for exactly that reason, not just as glue.
+  - **The DCT step lives in `process_and_forward`**, called from both of
+    `appsink`'s `new_preroll` and `new_sample` callbacks: pull the sample,
+    extract RGB planes via `gst_video::VideoFrameRef` (stride-aware, same
+    algorithm `split_rgb_planes`/`join_rgb_planes` always used, just
+    reading/writing `VideoFrameRef` instead of an `ff::frame::Video`),
+    call `DctBackend::process_rgb` (unchanged), reassemble into a new
+    buffer, copy the original buffer's PTS/DTS/duration across unchanged
+    (GStreamer expresses time in nanoseconds uniformly through the whole
+    pipeline — unlike the old ffmpeg-next path, there is no timebase to
+    rescale), and `appsrc.push_buffer(...)`.
+  - **`appsink` delivers its very first buffer via `new_preroll` *and* the
+    first `new_sample` call after reaching `Playing`** — both for the
+    *same* buffer (confirmed empirically: both calls reported an identical
+    PTS). `process_and_forward` dedups via a shared `last_pts: Mutex<
+    Option<ClockTime>>`, skipping a call whose PTS matches the immediately
+    preceding one. Skipping `new_preroll`'s forward entirely (only
+    handling `new_sample`) is *not* a fix: without it, the video encode
+    branch never gets a first buffer at all, which stalls the whole
+    pipeline's `Paused`->`Playing` transition forever (the muxer, a
+    `GstAggregator`, can't complete preroll on a starved pad) — confirmed
+    by reproducing that hang with a no-op `new_preroll`. Both callbacks
+    must forward identically; the dedup has to happen on the PTS instead.
+  - **`appsink`'s EOS is not automatically forwarded to `appsrc`** —
+    without an explicit `.eos(|_| appsrc.end_of_stream())` callback, the
+    encode branch never learns decoding finished and the pipeline hangs
+    forever after the last frame.
+  - **`appsrc`'s caps must be fully specified** (`format`+`width`+
+    `height`+`framerate`, not just `format`) before any buffer is pushed,
+    or negotiation fails at `Playing` with "no width property given" —
+    set once the decoded video pad's own caps are known, in
+    `connect_pad_added`, since `appsrc` has no upstream to negotiate
+    dimensions from the way `appsink` does.
+  - **A *strong* clone of `pipeline` captured inside `decodebin`'s
+    `pad-added` closure is a reference cycle**, not just a convenience:
+    the closure is stored inside `decodebin`, which is a child element
+    owned by `pipeline` itself, so `pipeline -> decodebin -> closure ->
+    pipeline` never drops. That silently leaked *every* `tx` clone held
+    by *any* callback on *any* element in the pipeline, which meant the
+    `PipelineMsg` channel never closed and every caller's `while let
+    Some(msg) = rx.recv()` loop hung forever — even after already
+    receiving `Done`/`Error` — regardless of whether the underlying
+    encode would've succeeded (confirmed: all of `tests/integration.rs`'s
+    tests hung identically). `pipeline.downgrade()` (a `glib::WeakRef`,
+    `.upgrade()`'d only where actually needed — the total-duration query)
+    breaks the cycle.
+  - **`pipeline.set_state(Null)` must run on *every* exit path, not just
+    the success one.** Early on, a `set_state(Playing)` failure (e.g.
+    missing input file) returned via `?` before ever reaching the
+    Null-transition cleanup at the end of the function — and dropping a
+    `gst::Pipeline` that was never cleanly transitioned to `Null` can
+    itself hang during teardown (GStreamer's internal dispose logic
+    forcing a state change while finalizing). Fixed by collecting the
+    Playing-transition result into a local instead of using `?` on it
+    directly, so the `Null` transition always runs before the function
+    returns either way.
+  - **`filesink` opens (creates/truncates) its output file as part of the
+    pipeline's state transition, independent of whether upstream (e.g.
+    `filesrc` on a missing input) ever actually succeeds** — so a failed
+    encode can leave a zero-byte output file behind. `run_inner` removes
+    `output_path` on any error return to match the old ffmpeg-next
+    behavior (which never touched the file at all in that case).
+  - **Total-frame estimate for progress reporting**: `query_duration`
+    reliably returns `None` at `pad-added` time (confirmed — too early,
+    before the demuxer has parsed enough to know it) and `DurationChanged`
+    isn't reliably posted for every demuxer/container combination either
+    (confirmed — never fired for either an mp4 or an mkv test fixture
+    here). What actually works: block on `pipeline.state(timeout)` right
+    after `set_state(Playing)` (waits for the async `Paused`->`Playing`
+    transition to genuinely finish) and query once more at that point —
+    by then the demuxer has necessarily parsed far enough to answer. Falls
+    back to `0` ("unknown") if even that fails, same tolerant behavior as
+    the old ffmpeg-next-based estimate.
+  - **`qtmux`/`x265enc`+VAAPI-HEVC caveat**: `x265enc`'s raw output caps
+    don't satisfy `qtmux`'s video pad template without a `h265parse`
+    element in between (see `encoders.rs` above) — and this AMD/Mesa
+    VAAPI driver's `vah265enc` pads non-64-aligned frame dimensions to the
+    next HEVC CTU boundary without writing a correct SPS conformance-window
+    crop back, so a probe of the muxed output can report the *padded*
+    dimensions instead of the real ones (confirmed directly with
+    `gst-launch-1.0`) — a genuine driver limitation, not something
+    `pipeline.rs` can fix; `tests/integration.rs`'s shared multi-encoder
+    fixture stays 64-aligned specifically to sidestep it.
+  - **`vp9enc` cannot mux into `qtmux`** in this GStreamer version: it
+    never emits a `chroma-format` field in its output caps regardless of
+    upstream pixel format, while `qtmux`'s `video/x-vp9` pad template
+    requires one (confirmed by testing every pixel format `vp9enc`
+    accepts) — `matroskamux` has no such requirement and works fine.
+    `tests/integration.rs` tolerates this specific combination as a known
+    muxer gap, the same way it already tolerates hardware-encoder
+    unavailability.
   - `split_rgb_planes`/`join_rgb_planes` parallelize their per-row loops
-    with `rayon` (`par_chunks_mut`) — each row is a disjoint read/write, no
-    aliasing between them.
-  - `PipelineMsg` is the channel payload (`Progress`/`Log`/`Done`/`Error`),
-    sent over a `tokio::sync::mpsc::UnboundedSender` (aliased as `Sender`
-    via `use tokio::sync::mpsc::UnboundedSender as Sender` — `send()` is
-    still a plain synchronous call, so none of the three pipeline threads
-    needed to become async). This is a *different* channel from the
-    internal `WorkItem`/`EncodeItem` ones above — `PipelineMsg` is the
-    outward-facing progress/log feed the UI subscribes to.
+    with `rayon` (`par_chunks_mut`) — each row is a disjoint read/write,
+    no aliasing between them; unchanged in spirit from the ffmpeg-next
+    version, just reading/writing `gst_video::VideoFrameRef` now.
   - `PipelineMsg::Log` (→ the UI's in-app log panel) and `tracing::{info,
     debug,warn,error}!` (→ stderr/whatever subscriber `main.rs` installs)
     fire at the same call sites deliberately — they're different audiences
@@ -264,13 +347,6 @@ only) `shader.wgsl`.
     `tracing` on purpose: test binaries never call `tracing_subscriber::
     fmt::init()`, so a `tracing` call there would silently vanish instead
     of printing.
-
-- **`src/pipeline.rs`**'s `run`/`run_inner` take a `backend: ComputeBackend`
-  parameter (alongside `encoder_choice`); `run_inner` resolves it once via
-  `backend.build()?` into a `Box<dyn DctBackend>` before the pipeline
-  starts, and the GPU-stage loop calls `.process_rgb(...)` on that trait
-  object — the loop body doesn't know or care which concrete backend it's
-  driving.
 
 - **`src/gpu.rs`** — `DctGpu`: the whole-frame (not block-based) separable
   2D DCT. Per plane, 4 GPU dispatches ping-pong two buffers: forward row →
