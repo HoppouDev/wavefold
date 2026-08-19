@@ -38,6 +38,7 @@ enum Command {
 
 fn main() {
     tracing_subscriber::fmt::init();
+    use_bundled_gstreamer_plugins_if_present();
     match Cli::parse().command.unwrap_or(Command::Gui) {
         Command::Gui => {
             if let Err(e) = run_gui() {
@@ -47,6 +48,23 @@ fn main() {
         }
         Command::Encode { input, output, cutoff, encoder, backend } => {
             run_encode(input, output, cutoff, encoder, backend);
+        }
+    }
+}
+
+/// The Windows release (installer and .zip) bundles the GStreamer runtime
+/// and its plugins in a `gstreamer-1.0` folder next to `wavefold.exe`,
+/// since Windows has no system package manager providing it the way
+/// Linux distros do. `gst::init()` only picks up plugins from
+/// `GST_PLUGIN_PATH`/the system registry, so point it at that folder
+/// when present. No-op on Linux/macOS, where GStreamer is expected to
+/// already be installed system-wide (see README).
+fn use_bundled_gstreamer_plugins_if_present() {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(plugin_dir) = exe.parent().map(|dir| dir.join("gstreamer-1.0")) {
+            if plugin_dir.is_dir() {
+                std::env::set_var("GST_PLUGIN_PATH", plugin_dir);
+            }
         }
     }
 }

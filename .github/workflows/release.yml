@@ -109,13 +109,22 @@ jobs:
           $stage = "wavefold-${{ needs.version.outputs.version }}-${{ env.arch }}"
           New-Item -ItemType Directory -Path $stage | Out-Null
           Copy-Item "target\${{ env.target }}\release\wavefold.exe" $stage\
+          # Bundle the GStreamer runtime + plugins: there's no system
+          # package manager providing it on Windows the way there is on
+          # Linux, so without this the installed exe fails to even start
+          # (missing gstreamer-1.0-0.dll etc.) - confirmed against a real
+          # v0.1.0 build. use_bundled_gstreamer_plugins_if_present() in
+          # main.rs points GST_PLUGIN_PATH at the gstreamer-1.0 folder
+          # this creates, next to the exe, at startup.
+          Copy-Item C:\gstreamer\bin\*.dll $stage\
+          Copy-Item C:\gstreamer\lib\gstreamer-1.0 "$stage\gstreamer-1.0" -Recurse
           Copy-Item LICENSE.md,README.md $stage\
           Compress-Archive -Path $stage -DestinationPath "$stage.zip"
 
       - uses: actions/upload-artifact@v4
         with:
           name: windows-${{ env.arch }}-exe
-          path: target/${{ env.target }}/release/wavefold.exe
+          path: wavefold-${{ needs.version.outputs.version }}-${{ env.arch }}
           retention-days: 1
 
       - uses: softprops/action-gh-release@v2
@@ -172,13 +181,22 @@ jobs:
           $stage = "wavefold-${{ needs.version.outputs.version }}-${{ env.arch }}"
           New-Item -ItemType Directory -Path $stage | Out-Null
           Copy-Item "target\${{ env.target }}\release\wavefold.exe" $stage\
+          # Bundle the GStreamer runtime + plugins: there's no system
+          # package manager providing it on Windows the way there is on
+          # Linux, so without this the installed exe fails to even start
+          # (missing gstreamer-1.0-0.dll etc.) - confirmed against a real
+          # v0.1.0 build. use_bundled_gstreamer_plugins_if_present() in
+          # main.rs points GST_PLUGIN_PATH at the gstreamer-1.0 folder
+          # this creates, next to the exe, at startup.
+          Copy-Item C:\gstreamer\bin\*.dll $stage\
+          Copy-Item C:\gstreamer\lib\gstreamer-1.0 "$stage\gstreamer-1.0" -Recurse
           Copy-Item LICENSE.md,README.md $stage\
           Compress-Archive -Path $stage -DestinationPath "$stage.zip"
 
       - uses: actions/upload-artifact@v4
         with:
           name: windows-${{ env.arch }}-exe
-          path: target/${{ env.target }}/release/wavefold.exe
+          path: wavefold-${{ needs.version.outputs.version }}-${{ env.arch }}
           retention-days: 1
 
       - uses: softprops/action-gh-release@v2

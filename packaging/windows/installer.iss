@@ -61,6 +61,11 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
 
 [Files]
 Source: "{#SourceDir}\wavefold.exe"; DestDir: "{app}"; Flags: ignoreversion
+; Bundled GStreamer runtime + plugins (see release.yml's Package step
+; and main.rs's use_bundled_gstreamer_plugins_if_present()) - without
+; these the installed exe can't even start.
+Source: "{#SourceDir}\*.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\gstreamer-1.0\*"; DestDir: "{app}\gstreamer-1.0"; Flags: ignoreversion recursesubdirs
 Source: "..\..\assets\windows\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\LICENSE.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\README.md"; DestDir: "{app}"; Flags: ignoreversion
