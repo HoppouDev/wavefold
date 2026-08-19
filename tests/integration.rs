@@ -320,3 +320,80 @@ fn encodes_clip_with_unspecified_channel_layout_audio() {
     let _ = std::fs::remove_file(&input);
     let _ = std::fs::remove_file(&output);
 }
+
+/// Regression test for a real-world "total unknown" progress bug: Matroska
+/// (and some other containers) commonly omit per-stream `duration`/
+/// `nb_frames` metadata entirely, even though the overall file duration is
+/// known (mkv stores it in the Segment Info, not per-track) — confirmed via
+/// `ffprobe` that this synthesized clip reproduces exactly that (stream
+/// duration/nb_frames both `N/A`, format-level duration present).
+/// `run_inner`'s total-frame estimate now falls back to the format-level
+/// duration in that case instead of leaving `total` at 0 ("unknown") for
+/// the whole encode.
+#[test]
+fn estimates_total_frames_from_format_duration_when_stream_metadata_missing() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    if dctenc::gpu::DctGpu::new().is_err() {
+        eprintln!("skipping: no GPU adapter available");
+        return;
+    }
+
+    let input = unique_path("in_no_stream_duration.mkv");
+    let status = Command::new("ffmpeg")
+        .args(["-v", "error", "-f", "lavfi"])
+        .args(["-i", "testsrc=size=48x32:duration=1:rate=8"])
+        .args(["-f", "lavfi"])
+        .args(["-i", "sine=frequency=440:duration=1"])
+        .args(["-c:v", "libx264", "-c:a", "pcm_s16le", "-y"])
+        .arg(&input)
+        .status()
+        .expect("failed to spawn ffmpeg");
+    assert!(status.success(), "ffmpeg failed to generate test clip");
+
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0"])
+        .args(["-show_entries", "stream=duration,nb_frames"])
+        .args(["-of", "default=noprint_wrappers=1"])
+        .arg(&input)
+        .output()
+        .expect("failed to spawn ffprobe");
+    let probe_text = String::from_utf8_lossy(&probe.stdout);
+    assert!(
+        probe_text.contains("duration=N/A") && probe_text.contains("nb_frames=N/A"),
+        "test fixture no longer reproduces missing stream-level duration/nb_frames — this test needs a new repro: {probe_text}"
+    );
+
+    let output = unique_path("out_no_stream_duration.mp4");
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let input2 = input.clone();
+    let output2 = output.clone();
+    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, dctenc::encoders::EncoderChoice::H264, tx));
+
+    let mut saw_done = false;
+    let mut saw_error = None;
+    let mut last_total = 0u64;
+    while let Some(msg) = rx.blocking_recv() {
+        match msg {
+            PipelineMsg::Progress { total, .. } => last_total = total,
+            PipelineMsg::Error(e) => saw_error = Some(e),
+            PipelineMsg::Done => saw_done = true,
+            _ => {}
+        }
+    }
+    handle.join().unwrap();
+
+    if let Some(e) = saw_error {
+        panic!("pipeline reported an error: {e}");
+    }
+    assert!(saw_done, "pipeline never sent Done");
+    // 1 second at 8fps: expect an estimate close to 8, not 0 ("unknown")
+    // and not wildly wrong (this exact bug once computed a total in the
+    // hundreds of trillions from a unit-conversion mistake).
+    assert!((6..=10).contains(&last_total), "expected total near 8 frames, got {last_total}");
+
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&output);
+}

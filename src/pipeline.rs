@@ -250,8 +250,21 @@ fn run_inner(
     };
     let fps: f64 = frame_rate.numerator() as f64 / frame_rate.denominator() as f64;
     let nb_frames = stream.frames().max(0) as u64;
-    let duration_secs = if stream.duration() > 0 {
+    let stream_duration_secs = if stream.duration() > 0 {
         stream.duration() as f64 * f64::from(time_base)
+    } else {
+        0.0
+    };
+    // Matroska (and some other containers) commonly omit per-stream
+    // duration/frame-count metadata entirely — both legitimately
+    // unavailable, not just zero — even though the overall file duration
+    // is known (mkv stores it in the Segment Info, not per-track). Fall
+    // back to the format-level duration in that case so progress still
+    // shows a total instead of "unknown".
+    let duration_secs = if stream_duration_secs > 0.0 {
+        stream_duration_secs
+    } else if ictx.duration() > 0 {
+        ictx.duration() as f64 * f64::from(ff::rescale::TIME_BASE)
     } else {
         0.0
     };
