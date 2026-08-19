@@ -1,7 +1,9 @@
 use dctenc::encoders::EncoderChoice;
 use dctenc::pipeline::{self, PipelineMsg};
+use iced::widget::{button, column, pick_list, progress_bar, row, scrollable, slider, text};
+use iced::{Element, Fill, Task};
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, Sender};
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 struct App {
     input: Option<PathBuf>,
@@ -12,7 +14,6 @@ struct App {
     progress_current: u64,
     progress_total: u64,
     log: Vec<String>,
-    rx: Option<Receiver<PipelineMsg>>,
 }
 
 impl Default for App {
@@ -26,137 +27,175 @@ impl Default for App {
             progress_current: 0,
             progress_total: 0,
             log: Vec::new(),
-            rx: None,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+enum Message {
+    PickInput,
+    InputPicked(Option<PathBuf>),
+    PickOutput,
+    OutputPicked(Option<PathBuf>),
+    CutoffChanged(f32),
+    EncoderSelected(EncoderChoice),
+    StartEncode,
+    Pipeline(PipelineMsg),
+    WorkerDone,
+}
+
+async fn pick_input_file() -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .add_filter("video", &["mp4", "mov", "mkv", "avi", "webm", "m4v"])
+        .pick_file()
+        .await
+        .map(|f| f.path().to_path_buf())
+}
+
+async fn pick_output_file() -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .set_file_name("output.mp4")
+        .add_filter("mp4", &["mp4"])
+        .save_file()
+        .await
+        .map(|f| f.path().to_path_buf())
 }
 
 impl App {
-    fn start_encode(&mut self) {
-        let (Some(input), Some(output)) = (self.input.clone(), self.output.clone()) else { return };
-        let cutoff = self.cutoff;
-        let encoder = self.encoder;
-        let (tx, rx): (Sender<PipelineMsg>, Receiver<PipelineMsg>) = std::sync::mpsc::channel();
-        self.rx = Some(rx);
-        self.running = true;
-        self.progress_current = 0;
-        self.progress_total = 0;
-        self.log.clear();
-        std::thread::spawn(move || {
-            pipeline::run(&input, &output, cutoff, encoder, tx);
-        });
-    }
+    fn update(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::PickInput => Task::perform(pick_input_file(), Message::InputPicked),
+            Message::InputPicked(path) => {
+                if path.is_some() {
+                    self.input = path;
+                }
+                Task::none()
+            }
+            Message::PickOutput => Task::perform(pick_output_file(), Message::OutputPicked),
+            Message::OutputPicked(path) => {
+                if path.is_some() {
+                    self.output = path;
+                }
+                Task::none()
+            }
+            Message::CutoffChanged(cutoff) => {
+                self.cutoff = cutoff;
+                Task::none()
+            }
+            Message::EncoderSelected(encoder) => {
+                self.encoder = encoder;
+                Task::none()
+            }
+            Message::StartEncode => {
+                let (Some(input), Some(output)) = (self.input.clone(), self.output.clone()) else {
+                    return Task::none();
+                };
+                self.running = true;
+                self.progress_current = 0;
+                self.progress_total = 0;
+                self.log.clear();
+                let cutoff = self.cutoff;
+                let encoder = self.encoder;
 
-    fn poll(&mut self) {
-        let Some(rx) = &self.rx else { return };
-        loop {
-            match rx.try_recv() {
-                Ok(PipelineMsg::Progress { current, total }) => {
-                    self.progress_current = current;
-                    self.progress_total = total;
-                }
-                Ok(PipelineMsg::Log(l)) => self.log.push(l),
-                Ok(PipelineMsg::Done) => {
-                    self.log.push("done.".into());
-                    self.running = false;
-                }
-                Ok(PipelineMsg::Error(e)) => {
-                    self.log.push(format!("ERROR: {e}"));
-                    self.running = false;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    if self.running {
-                        self.log.push("ERROR: encoder thread ended unexpectedly".into());
-                        self.running = false;
+                // `pipeline::run` internally spawns its own producer thread
+                // and blocks the calling thread until the whole encode is
+                // done, so it runs on a plain OS thread here rather than
+                // inside this async Task; progress streams back over a
+                // tokio channel, which `Task::run` turns into a `Message`
+                // per item instead of requiring the UI to poll each frame.
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                std::thread::spawn(move || pipeline::run(&input, &output, cutoff, encoder, tx));
+
+                Task::run(UnboundedReceiverStream::new(rx), Message::Pipeline)
+                    .chain(Task::done(Message::WorkerDone))
+            }
+            Message::Pipeline(msg) => {
+                match msg {
+                    PipelineMsg::Progress { current, total } => {
+                        self.progress_current = current;
+                        self.progress_total = total;
                     }
-                    break;
+                    PipelineMsg::Log(line) => self.log.push(line),
+                    PipelineMsg::Done => self.log.push("done.".into()),
+                    PipelineMsg::Error(e) => self.log.push(format!("ERROR: {e}")),
                 }
+                Task::none()
+            }
+            Message::WorkerDone => {
+                self.running = false;
+                Task::none()
             }
         }
     }
-}
 
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.poll();
-        if self.running {
-            ui.ctx().request_repaint();
-        }
+    fn view(&self) -> Element<'_, Message> {
+        let input_row = row![
+            button("Select input video...").on_press(Message::PickInput),
+            text(self.input.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(none)".into())),
+        ]
+        .spacing(10);
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("DCT GPU Video Encoder");
-            ui.label("Distortion effect: transforms each entire frame as one whole-image DCT (cosine basis), keeps only the lowest-frequency coefficients, then re-encodes with ffmpeg. Dropping detail this way produces global ringing/ghosting across the whole frame rather than blocky artifacts.");
-            ui.separator();
+        let output_row = row![
+            button("Select output file...").on_press(Message::PickOutput),
+            text(self.output.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(none)".into())),
+        ]
+        .spacing(10);
 
-            ui.horizontal(|ui| {
-                if ui.button("Select input video...").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("video", &["mp4", "mov", "mkv", "avi", "webm", "m4v"])
-                        .pick_file()
-                    {
-                        self.input = Some(path);
-                    }
-                }
-                ui.label(self.input.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(none)".into()));
-            });
+        let cutoff_row = column![
+            slider(0.0..=2.0, self.cutoff, Message::CutoffChanged).step(0.01f32),
+            text(format!("DCT spectrum cutoff: {:.2}", self.cutoff)),
+            text("0 = DC only (max distortion, strong global ringing/ghosting). 2.0 = full spectrum (lossless)."),
+        ]
+        .spacing(5);
 
-            ui.horizontal(|ui| {
-                if ui.button("Select output file...").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .set_file_name("output.mp4")
-                        .add_filter("mp4", &["mp4"])
-                        .save_file()
-                    {
-                        self.output = Some(path);
-                    }
-                }
-                ui.label(self.output.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(none)".into()));
-            });
+        let encoder_row = row![
+            text("Encoder:"),
+            pick_list(EncoderChoice::ALL, Some(self.encoder), Message::EncoderSelected),
+        ]
+        .spacing(10);
 
-            ui.separator();
-            ui.add(egui::Slider::new(&mut self.cutoff, 0.0..=2.0).text("DCT spectrum cutoff"));
-            ui.label("0 = DC only (max distortion, strong global ringing/ghosting). 2.0 = full spectrum (lossless).");
+        let can_start = self.input.is_some() && self.output.is_some() && !self.running;
+        let encode_button = button("Encode").on_press_maybe(can_start.then_some(Message::StartEncode));
 
-            ui.horizontal(|ui| {
-                ui.label("Encoder:");
-                egui::ComboBox::from_id_salt("encoder")
-                    .selected_text(self.encoder.label())
-                    .show_ui(ui, |ui| {
-                        for choice in EncoderChoice::ALL {
-                            ui.selectable_value(&mut self.encoder, choice, choice.label());
-                        }
-                    });
-            });
+        let progress: Element<'_, Message> = if self.progress_total > 0 {
+            let frac = self.progress_current as f32 / self.progress_total as f32;
+            column![
+                progress_bar(0.0..=1.0, frac),
+                text(format!("{}/{}", self.progress_current, self.progress_total)),
+            ]
+            .spacing(5)
+            .into()
+        } else if self.running {
+            text(format!("frame {} (total unknown)", self.progress_current)).into()
+        } else {
+            column![].into()
+        };
 
-            ui.separator();
-            let can_start = self.input.is_some() && self.output.is_some() && !self.running;
-            if ui.add_enabled(can_start, egui::Button::new("Encode")).clicked() {
-                self.start_encode();
-            }
+        let log_view = scrollable(column(self.log.iter().map(|line| text(line.clone()).font(iced::Font::MONOSPACE).into())).spacing(2))
+            .height(220)
+            .width(Fill);
 
-            if self.progress_total > 0 {
-                let frac = self.progress_current as f32 / self.progress_total as f32;
-                ui.add(egui::ProgressBar::new(frac).text(format!("{}/{}", self.progress_current, self.progress_total)));
-            } else if self.running {
-                ui.add(egui::ProgressBar::new(0.0).text(format!("frame {}", self.progress_current)).animate(true));
-            }
-
-            ui.separator();
-            egui::ScrollArea::vertical().max_height(220.0).stick_to_bottom(true).show(ui, |ui| {
-                for line in &self.log {
-                    ui.monospace(line);
-                }
-            });
-        });
+        column![
+            text("DCT GPU Video Encoder").size(24),
+            text("Distortion effect: transforms each entire frame as one whole-image DCT (cosine basis), keeps only the lowest-frequency coefficients, then re-encodes with ffmpeg. Dropping detail this way produces global ringing/ghosting across the whole frame rather than blocky artifacts."),
+            input_row,
+            output_row,
+            cutoff_row,
+            encoder_row,
+            encode_button,
+            progress,
+            log_view,
+        ]
+        .spacing(12)
+        .padding(16)
+        .into()
     }
 }
 
-fn main() -> eframe::Result<()> {
+fn main() -> iced::Result {
     tracing_subscriber::fmt::init();
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([640.0, 520.0]),
-        ..Default::default()
-    };
-    eframe::run_native("DCT GPU Video Encoder", options, Box::new(|_cc| Ok(Box::new(App::default()))))
+    iced::application(App::default, App::update, App::view)
+        .title("DCT GPU Video Encoder")
+        .window_size((640.0, 640.0))
+        .run()
 }

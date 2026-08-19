@@ -1,7 +1,7 @@
 use dctenc::pipeline::{self, PipelineMsg};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
+use tokio::sync::mpsc;
 
 fn ffmpeg_available() -> bool {
     Command::new("ffmpeg").arg("-version").output().map(|o| o.status.success()).unwrap_or(false)
@@ -70,7 +70,7 @@ fn encodes_synthetic_clip_end_to_end() {
     let input = make_test_clip(48, 32, 8, 1); // 8 frames
     let output = unique_path("out.mp4");
 
-    let (tx, rx) = mpsc::channel();
+    let (tx, mut rx) = mpsc::unbounded_channel();
     let input2 = input.clone();
     let output2 = output.clone();
     let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, dctenc::encoders::EncoderChoice::H264, tx));
@@ -78,7 +78,7 @@ fn encodes_synthetic_clip_end_to_end() {
     let mut saw_done = false;
     let mut saw_error = None;
     let mut last_progress = (0u64, 0u64);
-    for msg in rx {
+    while let Some(msg) = rx.blocking_recv() {
         match msg {
             PipelineMsg::Progress { current, total } => last_progress = (current, total),
             PipelineMsg::Log(_) => {}
@@ -111,14 +111,14 @@ fn reports_error_for_nonexistent_input() {
         return;
     }
     let output = unique_path("should_not_exist.mp4");
-    let (tx, rx) = mpsc::channel();
+    let (tx, mut rx) = mpsc::unbounded_channel();
     let out2 = output.clone();
     let handle = std::thread::spawn(move || {
         pipeline::run(std::path::Path::new("/nonexistent/dctenc_missing_input.mp4"), &out2, 0.32, dctenc::encoders::EncoderChoice::H264, tx)
     });
 
     let mut saw_error = false;
-    for msg in rx {
+    while let Some(msg) = rx.blocking_recv() {
         if let PipelineMsg::Error(_) = msg {
             saw_error = true;
         }
@@ -152,14 +152,14 @@ fn encodes_synthetic_clip_with_audio_end_to_end() {
     assert!(status.success(), "ffmpeg failed to generate test clip with audio");
 
     let output = unique_path("out_audio.mp4");
-    let (tx, rx) = mpsc::channel();
+    let (tx, mut rx) = mpsc::unbounded_channel();
     let input2 = input.clone();
     let output2 = output.clone();
     let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, dctenc::encoders::EncoderChoice::H264, tx));
 
     let mut saw_done = false;
     let mut saw_error = None;
-    for msg in rx {
+    while let Some(msg) = rx.blocking_recv() {
         match msg {
             PipelineMsg::Error(e) => saw_error = Some(e),
             PipelineMsg::Done => saw_done = true,
@@ -202,14 +202,14 @@ fn encodes_with_every_selectable_encoder() {
         let input = make_test_clip(32, 24, 6, 1); // 6 frames
         let output = unique_path("out_encoder.mp4");
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let input2 = input.clone();
         let output2 = output.clone();
         let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.5, choice, tx));
 
         let mut saw_done = false;
         let mut saw_error = None;
-        for msg in rx {
+        while let Some(msg) = rx.blocking_recv() {
             match msg {
                 PipelineMsg::Error(e) => saw_error = Some(e),
                 PipelineMsg::Done => saw_done = true,

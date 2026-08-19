@@ -9,9 +9,10 @@ use ff::software::scaling::{context::Context as Scaler, flag::Flags as ScaleFlag
 use ff::Rescale;
 use rayon::prelude::*;
 use std::path::Path;
-use std::sync::mpsc::Sender;
+use tokio::sync::mpsc::UnboundedSender as Sender;
 use tracing::{debug, error, info, warn};
 
+#[derive(Debug, Clone)]
 pub enum PipelineMsg {
     Progress { current: u64, total: u64 },
     Log(String),
