@@ -73,7 +73,7 @@ fn encodes_synthetic_clip_end_to_end() {
     let (tx, rx) = mpsc::channel();
     let input2 = input.clone();
     let output2 = output.clone();
-    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 20, tx));
+    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, tx));
 
     let mut saw_done = false;
     let mut saw_error = None;
@@ -114,7 +114,7 @@ fn reports_error_for_nonexistent_input() {
     let (tx, rx) = mpsc::channel();
     let out2 = output.clone();
     let handle = std::thread::spawn(move || {
-        pipeline::run(std::path::Path::new("/nonexistent/dctenc_missing_input.mp4"), &out2, 16, tx)
+        pipeline::run(std::path::Path::new("/nonexistent/dctenc_missing_input.mp4"), &out2, 0.32, tx)
     });
 
     let mut saw_error = false;

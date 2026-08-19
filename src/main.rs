@@ -5,7 +5,7 @@ use std::sync::mpsc::{Receiver, Sender};
 struct App {
     input: Option<PathBuf>,
     output: Option<PathBuf>,
-    quality: u32,
+    cutoff: f32,
     running: bool,
     progress_current: u64,
     progress_total: u64,
@@ -18,7 +18,7 @@ impl Default for App {
         Self {
             input: None,
             output: None,
-            quality: 30,
+            cutoff: 0.6,
             running: false,
             progress_current: 0,
             progress_total: 0,
@@ -31,7 +31,7 @@ impl Default for App {
 impl App {
     fn start_encode(&mut self) {
         let (Some(input), Some(output)) = (self.input.clone(), self.output.clone()) else { return };
-        let quality = self.quality;
+        let cutoff = self.cutoff;
         let (tx, rx): (Sender<PipelineMsg>, Receiver<PipelineMsg>) = std::sync::mpsc::channel();
         self.rx = Some(rx);
         self.running = true;
@@ -39,7 +39,7 @@ impl App {
         self.progress_total = 0;
         self.log.clear();
         std::thread::spawn(move || {
-            pipeline::run(&input, &output, quality, tx);
+            pipeline::run(&input, &output, cutoff, tx);
         });
     }
 
@@ -111,8 +111,8 @@ impl eframe::App for App {
             });
 
             ui.separator();
-            ui.add(egui::Slider::new(&mut self.quality, 1..=100).text("quality % (low-frequency spectrum kept)"));
-            ui.label("Low = strong global ringing/ghosting across the whole frame. 100 = full fidelity (nothing dropped).");
+            ui.add(egui::Slider::new(&mut self.cutoff, 0.0..=2.0).text("DCT spectrum cutoff"));
+            ui.label("0 = DC only (max distortion, strong global ringing/ghosting). 2.0 = full spectrum (lossless).");
 
             ui.separator();
             let can_start = self.input.is_some() && self.output.is_some() && !self.running;

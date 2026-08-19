@@ -17,7 +17,7 @@ struct Params {
     _pad2: u32,
 }
 
-/// GPU resources for one fixed (width, height, quality) combination, reused
+/// GPU resources for one fixed (width, height, cutoff) combination, reused
 /// across every `process_plane` call instead of being allocated fresh each
 /// time. Buffers `a` and `b` are ping-ponged across the 4 passes of a
 /// separable whole-frame 2D DCT (forward row, forward col + mask, inverse
@@ -29,7 +29,7 @@ struct Params {
 struct PlaneBuffers {
     width: u32,
     height: u32,
-    quality: u32,
+    cutoff: f32,
     row_basis_buf: wgpu::Buffer,
     row_basis_t_buf: wgpu::Buffer,
     col_basis_buf: wgpu::Buffer,
@@ -218,11 +218,12 @@ impl DctGpu {
     }
 
     /// Runs the whole-frame forward+quantize+inverse DCT on one single-channel
-    /// plane (row-major, f32 0..255). `quality` is a 0..=100 percentage of the
-    /// low-frequency spectrum kept: 100 is (near-)lossless, low values keep
-    /// only the coefficients closest to DC, producing strong global ringing.
-    pub fn process_plane(&self, pixels: &[f32], width: u32, height: u32, quality: u32) -> Result<Vec<f32>> {
-        self.encode_plane(0, pixels, width, height, quality)?;
+    /// plane (row-major, f32 0..255). `cutoff` is the normalized diagonal
+    /// frequency cutoff in `0.0..=2.0` (see shader.wgsl): 2.0 keeps the whole
+    /// spectrum ((near-)lossless), values near 0 keep only the coefficients
+    /// closest to DC, producing strong global ringing.
+    pub fn process_plane(&self, pixels: &[f32], width: u32, height: u32, cutoff: f32) -> Result<Vec<f32>> {
+        self.encode_plane(0, pixels, width, height, cutoff)?;
         self.read_plane(0)
     }
 
@@ -237,11 +238,11 @@ impl DctGpu {
         b: &[f32],
         width: u32,
         height: u32,
-        quality: u32,
+        cutoff: f32,
     ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
-        self.encode_plane(0, r, width, height, quality)?;
-        self.encode_plane(1, g, width, height, quality)?;
-        self.encode_plane(2, b, width, height, quality)?;
+        self.encode_plane(0, r, width, height, cutoff)?;
+        self.encode_plane(1, g, width, height, cutoff)?;
+        self.encode_plane(2, b, width, height, cutoff)?;
         let r_out = self.read_plane(0)?;
         let g_out = self.read_plane(1)?;
         let b_out = self.read_plane(2)?;
@@ -251,7 +252,7 @@ impl DctGpu {
     /// Validates inputs, (re)builds the channel's cached buffers if needed,
     /// uploads `pixels`, and submits all 4 DCT passes — but does not block
     /// on the result. Pair with `read_plane` on the same `channel`.
-    fn encode_plane(&self, channel: usize, pixels: &[f32], width: u32, height: u32, quality: u32) -> Result<()> {
+    fn encode_plane(&self, channel: usize, pixels: &[f32], width: u32, height: u32, cutoff: f32) -> Result<()> {
         if width == 0 || height == 0 {
             bail!("process_plane: width and height must both be non-zero (got {width}x{height})");
         }
@@ -282,13 +283,13 @@ impl DctGpu {
             if !dims_match {
                 // Dimensions changed (or first use): full rebuild, including
                 // the O(width^2+height^2) basis matrices.
-                *cache = Some(self.build_plane_buffers(width, height, quality, size_bytes));
+                *cache = Some(self.build_plane_buffers(width, height, cutoff, size_bytes));
             } else if let Some(b) = cache.as_mut() {
-                if b.quality != quality {
-                    // Same frame size, only the quality knob moved: rewrite
+                if b.cutoff != cutoff {
+                    // Same frame size, only the cutoff knob moved: rewrite
                     // just the threshold in place, skip regenerating/
                     // re-uploading the (unchanged) basis matrices.
-                    let threshold = (quality.min(100) as f32 / 100.0) * 2.0 + 1e-4;
+                    let threshold = cutoff.clamp(0.0, 2.0) + f32::EPSILON;
                     let params = Params {
                         width,
                         height,
@@ -300,7 +301,7 @@ impl DctGpu {
                         _pad2: 0,
                     };
                     self.queue.write_buffer(&b.mask_params_buf, 0, bytemuck::bytes_of(&params));
-                    b.quality = quality;
+                    b.cutoff = cutoff;
                 }
             }
         }
@@ -373,7 +374,7 @@ impl DctGpu {
         Ok(result)
     }
 
-    fn build_plane_buffers(&self, width: u32, height: u32, quality: u32, size_bytes: u64) -> PlaneBuffers {
+    fn build_plane_buffers(&self, width: u32, height: u32, cutoff: f32, size_bytes: u64) -> PlaneBuffers {
         let row_basis = dct_basis(width as usize);
         let row_basis_t = transpose_square(&row_basis, width as usize);
         let col_basis = dct_basis(height as usize);
@@ -417,9 +418,9 @@ impl DctGpu {
 
         // Normalized diagonal frequency cutoff: 0 keeps only DC, 2.0 keeps
         // the entire spectrum (the maximum possible rank at the highest
-        // corner frequency). A small epsilon keeps quality=100 lossless
+        // corner frequency). A small epsilon keeps cutoff=2.0 lossless
         // despite floating-point rounding at that boundary.
-        let threshold = (quality.min(100) as f32 / 100.0) * 2.0 + 1e-4;
+        let threshold = cutoff.clamp(0.0, 2.0) + f32::EPSILON;
 
         let make_params = |row_basis: &wgpu::Buffer, col_basis: &wgpu::Buffer, apply_mask: bool, clamp_output: bool| {
             let params = Params {
@@ -478,7 +479,7 @@ impl DctGpu {
         PlaneBuffers {
             width,
             height,
-            quality,
+            cutoff,
             row_basis_buf,
             row_basis_t_buf,
             col_basis_buf,
@@ -531,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn full_quality_roundtrip_is_near_lossless() {
+    fn full_cutoff_roundtrip_is_near_lossless() {
         let Some(gpu) = skip_no_gpu() else { return };
         let (w, h) = (24u32, 18u32);
         // deterministic pseudo-random-ish pattern, no external RNG dependency
@@ -539,7 +540,7 @@ mod tests {
             .map(|i| ((i * 37 + 11) % 256) as f32)
             .collect();
 
-        let out = gpu.process_plane(&plane, w, h, 100).unwrap();
+        let out = gpu.process_plane(&plane, w, h, 2.0).unwrap();
         assert_eq!(out.len(), plane.len());
         for (a, b) in plane.iter().zip(out.iter()) {
             assert!((a - b).abs() < 1.0, "roundtrip drift too large: {a} vs {b}");
@@ -547,20 +548,20 @@ mod tests {
     }
 
     #[test]
-    fn very_low_quality_collapses_toward_the_frame_average() {
+    fn very_low_cutoff_collapses_toward_the_frame_average() {
         let Some(gpu) = skip_no_gpu() else { return };
         let (w, h) = (16u32, 16u32);
         let plane: Vec<f32> = (0..(w * h)).map(|i| (i % 256) as f32).collect();
         let mean = plane.iter().sum::<f32>() / plane.len() as f32;
 
-        let out = gpu.process_plane(&plane, w, h, 1).unwrap();
+        let out = gpu.process_plane(&plane, w, h, 0.02).unwrap();
         for v in out {
             assert!((v - mean).abs() < 5.0, "near-DC-only output {v} should be close to frame mean {mean}");
         }
     }
 
     #[test]
-    fn lower_quality_reduces_output_variance() {
+    fn lower_cutoff_reduces_output_variance() {
         let Some(gpu) = skip_no_gpu() else { return };
         let (w, h) = (16u32, 16u32);
         let plane: Vec<f32> = (0..(w * h)).map(|i| ((i * 53) % 256) as f32).collect();
@@ -570,13 +571,13 @@ mod tests {
             v.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / v.len() as f32
         };
 
-        let high_q = gpu.process_plane(&plane, w, h, 90).unwrap();
-        let low_q = gpu.process_plane(&plane, w, h, 10).unwrap();
+        let high_c = gpu.process_plane(&plane, w, h, 1.8).unwrap();
+        let low_c = gpu.process_plane(&plane, w, h, 0.2).unwrap();
         assert!(
-            variance(&low_q) < variance(&high_q),
-            "low quality should suppress detail more: var(low)={} var(high)={}",
-            variance(&low_q),
-            variance(&high_q)
+            variance(&low_c) < variance(&high_c),
+            "low cutoff should suppress detail more: var(low)={} var(high)={}",
+            variance(&low_c),
+            variance(&high_c)
         );
     }
 
@@ -588,7 +589,7 @@ mod tests {
         // case, where a naive `width - 1u` would divide by zero.
         for (w, h) in [(1u32, 9u32), (9u32, 1u32), (1u32, 1u32)] {
             let plane: Vec<f32> = (0..(w * h)).map(|i| (i * 17 % 256) as f32).collect();
-            let out = gpu.process_plane(&plane, w, h, 50).unwrap();
+            let out = gpu.process_plane(&plane, w, h, 1.0).unwrap();
             assert_eq!(out.len(), plane.len());
             assert!(out.iter().all(|v| v.is_finite()), "{w}x{h} produced a non-finite pixel");
         }
@@ -597,9 +598,9 @@ mod tests {
     #[test]
     fn rejects_zero_dimensions_and_mismatched_pixel_buffer() {
         let Some(gpu) = skip_no_gpu() else { return };
-        assert!(gpu.process_plane(&[], 0, 4, 50).is_err());
-        assert!(gpu.process_plane(&[], 4, 0, 50).is_err());
+        assert!(gpu.process_plane(&[], 0, 4, 1.0).is_err());
+        assert!(gpu.process_plane(&[], 4, 0, 1.0).is_err());
         let wrong_len = vec![0f32; 3];
-        assert!(gpu.process_plane(&wrong_len, 4, 4, 50).is_err());
+        assert!(gpu.process_plane(&wrong_len, 4, 4, 1.0).is_err());
     }
 }

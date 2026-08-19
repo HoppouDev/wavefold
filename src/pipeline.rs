@@ -16,8 +16,8 @@ pub enum PipelineMsg {
     Error(String),
 }
 
-pub fn run(input: &Path, output: &Path, quality: u32, tx: Sender<PipelineMsg>) {
-    if let Err(e) = run_inner(input, output, quality, &tx) {
+pub fn run(input: &Path, output: &Path, cutoff: f32, tx: Sender<PipelineMsg>) {
+    if let Err(e) = run_inner(input, output, cutoff, &tx) {
         let _ = tx.send(PipelineMsg::Error(format!("{e:#}")));
     }
 }
@@ -93,7 +93,7 @@ fn join_rgb_planes(width: u32, height: u32, r: &[f32], g: &[f32], b: &[f32]) -> 
     frame
 }
 
-fn run_inner(input_path: &Path, output_path: &Path, quality: u32, tx: &Sender<PipelineMsg>) -> Result<()> {
+fn run_inner(input_path: &Path, output_path: &Path, cutoff: f32, tx: &Sender<PipelineMsg>) -> Result<()> {
     ff::init()?;
 
     let _ = tx.send(PipelineMsg::Log("opening input...".into()));
@@ -142,7 +142,7 @@ fn run_inner(input_path: &Path, output_path: &Path, quality: u32, tx: &Sender<Pi
     }
 
     let _ = tx.send(PipelineMsg::Log(format!(
-        "{width}x{height} @ {fps:.3} fps, quality={quality}%"
+        "{width}x{height} @ {fps:.3} fps, cutoff={cutoff:.3}"
     )));
     // The whole-frame DCT is a naive O(width) / O(height) sum per output
     // pixel (not a fast O(N log N) transform), so cost grows steeply with
@@ -261,7 +261,7 @@ fn run_inner(input_path: &Path, output_path: &Path, quality: u32, tx: &Sender<Pi
         to_rgb.run(decoded, &mut rgb)?;
 
         let (r, g, b) = split_rgb_planes(&rgb, width, height);
-        let (r2, g2, b2) = gpu.process_rgb(&r, &g, &b, width, height, quality)?;
+        let (r2, g2, b2) = gpu.process_rgb(&r, &g, &b, width, height, cutoff)?;
         let rgb_out = join_rgb_planes(width, height, &r2, &g2, &b2);
 
         let mut yuv = VideoFrame::empty();
