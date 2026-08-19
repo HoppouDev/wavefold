@@ -54,8 +54,21 @@ fn main() {
 fn run_gui() -> iced::Result {
     iced::application(ui::App::default, ui::App::update, ui::App::view)
         .title("Wavefold")
-        .window_size((640.0, 640.0))
+        .window(iced::window::Settings {
+            size: (640.0, 640.0).into(),
+            icon: Some(load_icon()),
+            ..Default::default()
+        })
         .run()
+}
+
+fn load_icon() -> iced::window::Icon {
+    let image = image::load_from_memory(include_bytes!("../assets/windows/icon.png"))
+        .expect("embedded app icon is a valid PNG")
+        .to_rgba8();
+    let (width, height) = image.dimensions();
+    iced::window::icon::from_rgba(image.into_raw(), width, height)
+        .expect("embedded app icon has valid dimensions")
 }
 
 fn run_encode(input: PathBuf, output: PathBuf, cutoff: f32, encoder: EncoderChoice, backend: ComputeBackend) {
