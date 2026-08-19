@@ -249,3 +249,74 @@ fn encodes_with_every_selectable_encoder() {
         let _ = std::fs::remove_file(&output);
     }
 }
+
+/// Regression test for a real-world failure: some containers (this repros
+/// with a plain lavfi-generated pcm_s16le-in-mkv clip, same as e.g. some
+/// camera-recorded mkv files) don't record an explicit audio channel
+/// layout, so ffmpeg-next's demuxer reports it as unspecified
+/// (`AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC`, `channel_layout=unknown` in
+/// `ffprobe`). Passing that straight through to an mp4 output used to make
+/// the mov muxer fail the whole encode with "unsupported channel layout N
+/// channels" — `run_inner`'s audio setup now fills in a default layout for
+/// the channel count when the source's is unspecified.
+#[test]
+fn encodes_clip_with_unspecified_channel_layout_audio() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    if dctenc::gpu::DctGpu::new().is_err() {
+        eprintln!("skipping: no GPU adapter available");
+        return;
+    }
+
+    let input = unique_path("in_unspec_channels.mkv");
+    let status = Command::new("ffmpeg")
+        .args(["-v", "error", "-f", "lavfi"])
+        .args(["-i", "testsrc=size=48x32:duration=1:rate=8"])
+        .args(["-f", "lavfi"])
+        .args(["-i", "sine=frequency=440:duration=1"])
+        .args(["-c:v", "libx264", "-c:a", "pcm_s16le", "-y"])
+        .arg(&input)
+        .status()
+        .expect("failed to spawn ffmpeg");
+    assert!(status.success(), "ffmpeg failed to generate test clip");
+
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "a:0"])
+        .args(["-show_entries", "stream=channel_layout"])
+        .args(["-of", "default=noprint_wrappers=1"])
+        .arg(&input)
+        .output()
+        .expect("failed to spawn ffprobe");
+    assert!(
+        String::from_utf8_lossy(&probe.stdout).contains("channel_layout=unknown"),
+        "test fixture no longer reproduces an unspecified channel layout — this test needs a new repro"
+    );
+
+    let output = unique_path("out_unspec_channels.mp4");
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let input2 = input.clone();
+    let output2 = output.clone();
+    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, dctenc::encoders::EncoderChoice::H264, tx));
+
+    let mut saw_done = false;
+    let mut saw_error = None;
+    while let Some(msg) = rx.blocking_recv() {
+        match msg {
+            PipelineMsg::Error(e) => saw_error = Some(e),
+            PipelineMsg::Done => saw_done = true,
+            _ => {}
+        }
+    }
+    handle.join().unwrap();
+
+    if let Some(e) = saw_error {
+        panic!("pipeline reported an error: {e}");
+    }
+    assert!(saw_done, "pipeline never sent Done");
+    assert!(output.exists(), "output file was not created");
+
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&output);
+}

@@ -359,11 +359,23 @@ fn run_inner(
         let aist = ictx.stream(a_idx).context("audio input stream disappeared after being located")?;
         let mut aost = octx.add_stream(ff::encoder::find(ff::codec::Id::None))?;
         aost.set_parameters(aist.parameters());
-        // Zero the copied codec_tag: it's valid in the input's container but
-        // may not be recognized by the output muxer, causing strict players
-        // to misidentify or reject the passthrough track.
         unsafe {
-            (*aost.parameters().as_mut_ptr()).codec_tag = 0;
+            let params = aost.parameters().as_mut_ptr();
+            // Zero the copied codec_tag: it's valid in the input's container
+            // but may not be recognized by the output muxer, causing strict
+            // players to misidentify or reject the passthrough track.
+            (*params).codec_tag = 0;
+            // Some containers (e.g. mkv from certain camera/phone encoders)
+            // don't record an explicit channel layout, leaving it
+            // AV_CHANNEL_ORDER_UNSPEC after a pure parameter copy. The mp4
+            // muxer can't write a channel-layout box for an unspecified
+            // layout and fails the whole encode with "unsupported channel
+            // layout N channels" — fill in the standard layout for that
+            // channel count (e.g. stereo for 2 channels) so passthrough
+            // into mp4 always has something the muxer can write.
+            if (*params).ch_layout.order == ff::sys::AVChannelOrder::AV_CHANNEL_ORDER_UNSPEC {
+                ff::sys::av_channel_layout_default(&mut (*params).ch_layout, (*params).ch_layout.nb_channels);
+            }
         }
         Some(aost.index())
     } else {
