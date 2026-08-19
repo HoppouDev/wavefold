@@ -23,7 +23,7 @@
 
 #define AppName "Wavefold"
 #define AppPublisher "HoppouDev"
-#define AppURL "https://github.com/HoppouDev/wavefold"
+#define AppURL "https://hoppou.dev/projects/wavefold"
 
 [Setup]
 ; Fixed GUID - do not change between releases, it's how Windows recognizes
@@ -107,7 +107,14 @@ begin
   P := Pos(';' + Uppercase(Path) + ';', ';' + Uppercase(Paths) + ';');
   if P = 0 then
     exit;
-  Delete(Paths, P - 1, Length(Path) + 1);
+  if P = 1 then
+    { Path is the first entry: there's no leading ';' to remove in the
+      real (unpadded) string, only a trailing one - Delete(Paths, 0, ...)
+      would silently delete nothing (confirmed: Pascal Script's Delete
+      with Index=0 raises no exception but performs zero deletions). }
+    Delete(Paths, 1, Length(Path) + 1)
+  else
+    Delete(Paths, P - 1, Length(Path) + 1);
   RegWriteExpandStringValue(HKEY_LOCAL_MACHINE, EnvironmentKey, 'Path', Paths);
 end;
 

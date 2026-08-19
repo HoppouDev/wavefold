@@ -1,19 +1,19 @@
 # Same approach as Dockerfile.aarch64-unknown-linux-gnu, for riscv64gc -
-# see its comments for why extraction is staged through a tar pipe with
-# `--keep-directory-symlink` instead of a plain `apt-get install`.
+# see install-multiarch-gst-dev.sh for why extraction is staged through
+# a tar pipe with `--keep-directory-symlink` instead of a plain
+# `apt-get install`.
 #
 # cross-rs's base image doesn't enable the riscv64 architecture on
 # ports.ubuntu.com by default (only arm64/armhf) - add it explicitly.
+# The grep after the sed makes a future non-match (e.g. the base image
+# reordering or reformatting that line) a loud build failure here
+# instead of a silent no-op that only surfaces later as a confusing
+# "unable to locate package ...:riscv64" from apt.
 FROM ghcr.io/cross-rs/riscv64gc-unknown-linux-gnu:main
 
 RUN sed -i 's/^Architectures: arm64 armhf$/Architectures: arm64 armhf riscv64/' \
       /etc/apt/sources.list.d/ubuntu.sources && \
-    dpkg --add-architecture riscv64 && \
-    apt-get update && \
-    apt-get install --assume-yes --no-install-recommends --download-only \
-      libgstreamer1.0-dev:riscv64 \
-      libgstreamer-plugins-base1.0-dev:riscv64 && \
-    mkdir -p /tmp/riscv64-root && \
-    for deb in /var/cache/apt/archives/*_riscv64.deb; do dpkg-deb -x "$deb" /tmp/riscv64-root; done && \
-    (cd /tmp/riscv64-root && tar -cf - .) | tar -xf - -C / --keep-directory-symlink && \
-    rm -rf /tmp/riscv64-root /var/cache/apt/archives/*.deb /var/lib/apt/lists/*
+    grep -q '^Architectures: arm64 armhf riscv64$' /etc/apt/sources.list.d/ubuntu.sources
+
+COPY docker/install-multiarch-gst-dev.sh /tmp/install-multiarch-gst-dev.sh
+RUN /tmp/install-multiarch-gst-dev.sh riscv64 && rm /tmp/install-multiarch-gst-dev.sh

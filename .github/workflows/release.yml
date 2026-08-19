@@ -33,6 +33,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
       - uses: taiki-e/install-action@v2
         with:
           tool: cross@0.2.5
@@ -46,6 +50,8 @@ jobs:
           mkdir -p "$stage"
           cp target/${{ matrix.target }}/release/wavefold "$stage/"
           cp -r packaging/linux "$stage/"
+          mkdir -p "$stage/linux/icons/hicolor/scalable/apps"
+          cp assets/icon.svg "$stage/linux/icons/hicolor/scalable/apps/wavefold.svg"
           cp LICENSE.md README.md "$stage/"
           tar czf "$stage.tar.gz" "$stage"
 
@@ -53,72 +59,142 @@ jobs:
         with:
           files: wavefold-${{ needs.version.outputs.version }}-${{ matrix.target }}.tar.gz
 
-  windows:
+  windows-x64:
     needs: version
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x64
-            target: x86_64-pc-windows-msvc
-            runner: windows-latest
-            gst_installer: gstreamer-1.0-msvc-x86_64-1.28.6.exe
-          - arch: arm64
-            target: aarch64-pc-windows-msvc
-            runner: windows-11-arm
-            gst_installer: gstreamer-1.0-msvc-arm64-1.28.6.exe
-    runs-on: ${{ matrix.runner }}
+    runs-on: windows-latest
+    env:
+      arch: x64
+      target: x86_64-pc-windows-msvc
+      gst_installer: gstreamer-1.0-msvc-x86_64-1.28.6.exe
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ env.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.target }}
+
+      - name: Cache GStreamer installer
+        id: gst-cache
+        uses: actions/cache@v4
+        with:
+          path: gst-installer.exe
+          key: gst-installer-${{ env.gst_installer }}
+
+      - name: Download GStreamer installer
+        if: steps.gst-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $url = "https://gstreamer.freedesktop.org/data/pkg/windows/1.28.6/msvc/${{ env.gst_installer }}"
+          Invoke-WebRequest -Uri $url -OutFile gst-installer.exe
 
       - name: Install GStreamer (MSVC, complete/devel)
         shell: pwsh
         run: |
-          $url = "https://gstreamer.freedesktop.org/data/pkg/windows/1.28.6/msvc/${{ matrix.gst_installer }}"
-          Invoke-WebRequest -Uri $url -OutFile gst-installer.exe
           Start-Process -FilePath .\gst-installer.exe -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/TYPE=full","/DIR=C:\gstreamer" -Wait
+          if ($LASTEXITCODE -ne 0) {
+            throw "GStreamer installer exited with code $LASTEXITCODE"
+          }
           echo "C:\gstreamer\bin" >> $env:GITHUB_PATH
           echo "PKG_CONFIG_PATH=C:\gstreamer\lib\pkgconfig" >> $env:GITHUB_ENV
 
-      - run: cargo build --release --target ${{ matrix.target }}
+      - run: cargo build --release --target ${{ env.target }}
 
       - name: Package
         shell: pwsh
         run: |
-          $stage = "wavefold-${{ needs.version.outputs.version }}-${{ matrix.arch }}"
+          $stage = "wavefold-${{ needs.version.outputs.version }}-${{ env.arch }}"
           New-Item -ItemType Directory -Path $stage | Out-Null
-          Copy-Item "target\${{ matrix.target }}\release\wavefold.exe" $stage\
+          Copy-Item "target\${{ env.target }}\release\wavefold.exe" $stage\
           Copy-Item LICENSE.md,README.md $stage\
           Compress-Archive -Path $stage -DestinationPath "$stage.zip"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-${{ matrix.arch }}-exe
-          path: target/${{ matrix.target }}/release/wavefold.exe
+          name: windows-${{ env.arch }}-exe
+          path: target/${{ env.target }}/release/wavefold.exe
           retention-days: 1
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: wavefold-${{ needs.version.outputs.version }}-${{ matrix.arch }}.zip
+          files: wavefold-${{ needs.version.outputs.version }}-${{ env.arch }}.zip
 
-  windows-installer:
-    needs: [version, windows]
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [x64, arm64]
+  windows-arm64:
+    needs: version
+    runs-on: windows-11-arm
+    env:
+      arch: arm64
+      target: aarch64-pc-windows-msvc
+      gst_installer: gstreamer-1.0-msvc-arm64-1.28.6.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.target }}
+
+      - name: Cache GStreamer installer
+        id: gst-cache
+        uses: actions/cache@v4
+        with:
+          path: gst-installer.exe
+          key: gst-installer-${{ env.gst_installer }}
+
+      - name: Download GStreamer installer
+        if: steps.gst-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $url = "https://gstreamer.freedesktop.org/data/pkg/windows/1.28.6/msvc/${{ env.gst_installer }}"
+          Invoke-WebRequest -Uri $url -OutFile gst-installer.exe
+
+      - name: Install GStreamer (MSVC, complete/devel)
+        shell: pwsh
+        run: |
+          Start-Process -FilePath .\gst-installer.exe -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/TYPE=full","/DIR=C:\gstreamer" -Wait
+          if ($LASTEXITCODE -ne 0) {
+            throw "GStreamer installer exited with code $LASTEXITCODE"
+          }
+          echo "C:\gstreamer\bin" >> $env:GITHUB_PATH
+          echo "PKG_CONFIG_PATH=C:\gstreamer\lib\pkgconfig" >> $env:GITHUB_ENV
+
+      - run: cargo build --release --target ${{ env.target }}
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $stage = "wavefold-${{ needs.version.outputs.version }}-${{ env.arch }}"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item "target\${{ env.target }}\release\wavefold.exe" $stage\
+          Copy-Item LICENSE.md,README.md $stage\
+          Compress-Archive -Path $stage -DestinationPath "$stage.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ env.arch }}-exe
+          path: target/${{ env.target }}/release/wavefold.exe
+          retention-days: 1
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: wavefold-${{ needs.version.outputs.version }}-${{ env.arch }}.zip
+
+  windows-installer-x64:
+    needs: [version, windows-x64]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
         with:
-          name: windows-${{ matrix.arch }}-exe
-          path: packaging/windows/dist/${{ matrix.arch }}
+          name: windows-x64-exe
+          path: packaging/windows/dist/x64
 
       - name: Install Inno Setup
         run: choco install -y innosetup
@@ -128,10 +204,37 @@ jobs:
         run: >
           iscc
           /DAppVersion=${{ needs.version.outputs.version }}
-          /DArch=${{ matrix.arch }}
-          /DSourceDir=dist\${{ matrix.arch }}
+          /DArch=x64
+          /DSourceDir=dist\x64
           installer.iss
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: packaging/windows/dist/wavefold-${{ needs.version.outputs.version }}-${{ matrix.arch }}-setup.exe
+          files: packaging/windows/dist/wavefold-${{ needs.version.outputs.version }}-x64-setup.exe
+
+  windows-installer-arm64:
+    needs: [version, windows-arm64]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-arm64-exe
+          path: packaging/windows/dist/arm64
+
+      - name: Install Inno Setup
+        run: choco install -y innosetup
+
+      - name: Build installer
+        working-directory: packaging/windows
+        run: >
+          iscc
+          /DAppVersion=${{ needs.version.outputs.version }}
+          /DArch=arm64
+          /DSourceDir=dist\arm64
+          installer.iss
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: packaging/windows/dist/wavefold-${{ needs.version.outputs.version }}-arm64-setup.exe
