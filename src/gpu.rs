@@ -224,13 +224,16 @@ impl DctGpu {
     /// closest to DC, producing strong global ringing.
     pub fn process_plane(&self, pixels: &[f32], width: u32, height: u32, cutoff: f32) -> Result<Vec<f32>> {
         self.encode_plane(0, pixels, width, height, cutoff)?;
-        self.read_plane(0)
+        let rx = self.begin_read(0);
+        self.device.poll(wgpu::PollType::wait_indefinitely()).context("gpu poll failed")?;
+        self.finish_read(0, rx)
     }
 
     /// Same transform as `process_plane`, but for all three color planes of
-    /// one frame at once: all three channels' work is submitted to the GPU
-    /// before blocking on any of them, instead of a full stall-and-resume
-    /// round trip per channel.
+    /// one frame at once: all three channels' work is submitted to the GPU,
+    /// and all three `map_async` readbacks are issued, before blocking on
+    /// any of them — one `device.poll` drives all three to completion
+    /// instead of a full stall-and-resume round trip per channel.
     pub fn process_rgb(
         &self,
         r: &[f32],
@@ -243,9 +246,13 @@ impl DctGpu {
         self.encode_plane(0, r, width, height, cutoff)?;
         self.encode_plane(1, g, width, height, cutoff)?;
         self.encode_plane(2, b, width, height, cutoff)?;
-        let r_out = self.read_plane(0)?;
-        let g_out = self.read_plane(1)?;
-        let b_out = self.read_plane(2)?;
+        let rx0 = self.begin_read(0);
+        let rx1 = self.begin_read(1);
+        let rx2 = self.begin_read(2);
+        self.device.poll(wgpu::PollType::wait_indefinitely()).context("gpu poll failed")?;
+        let r_out = self.finish_read(0, rx0)?;
+        let g_out = self.finish_read(1, rx1)?;
+        let b_out = self.finish_read(2, rx2)?;
         Ok((r_out, g_out, b_out))
     }
 
@@ -352,20 +359,30 @@ impl DctGpu {
         Ok(())
     }
 
-    /// Blocks until `channel`'s previously-`encode_plane`'d work completes,
-    /// then reads back and returns the result.
-    fn read_plane(&self, channel: usize) -> Result<Vec<f32>> {
+    /// Issues the async map request for `channel`'s previously-`encode_plane`'d
+    /// staging buffer without blocking. Pair with `finish_read` on the same
+    /// `channel` after a `device.poll` — splitting the request from the wait
+    /// is what lets `process_rgb` issue all three channels' map requests
+    /// before blocking on any of them.
+    fn begin_read(&self, channel: usize) -> std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>> {
         let cache = self.buffers[channel].borrow();
-        let buffers = cache.as_ref().expect("encode_plane must be called before read_plane");
-
+        let buffers = cache.as_ref().expect("encode_plane must be called before begin_read");
         let slice = buffers.staging_buf.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
-        self.device.poll(wgpu::PollType::wait_indefinitely()).context("gpu poll failed")?;
+        rx
+    }
+
+    /// Waits for `channel`'s `begin_read` map request (already driven by a
+    /// `device.poll`) to complete, then reads back and returns the result.
+    fn finish_read(&self, channel: usize, rx: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>) -> Result<Vec<f32>> {
         rx.recv().context("gpu map channel closed")??;
 
+        let cache = self.buffers[channel].borrow();
+        let buffers = cache.as_ref().expect("encode_plane must be called before finish_read");
+        let slice = buffers.staging_buf.slice(..);
         let data = slice.get_mapped_range().context("failed to map gpu buffer")?;
         let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
         drop(data);

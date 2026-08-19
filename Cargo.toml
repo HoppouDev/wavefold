@@ -12,6 +12,7 @@ pollster = "1"
 anyhow = "1"
 rfd = "0.17"
 ffmpeg-next = "9"
+rayon = "1"
 
 [profile.release]
 opt-level = 3

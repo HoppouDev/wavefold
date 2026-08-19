@@ -127,3 +127,62 @@ fn reports_error_for_nonexistent_input() {
     assert!(saw_error, "expected an Error message for a missing input file");
     assert!(!output.exists());
 }
+
+#[test]
+fn encodes_synthetic_clip_with_audio_end_to_end() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    if dctenc::gpu::DctGpu::new().is_err() {
+        eprintln!("skipping: no GPU adapter available");
+        return;
+    }
+
+    let input = unique_path("in_audio.mp4");
+    let status = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-f", "lavfi"])
+        .args(["-i", "testsrc=size=48x32:duration=1:rate=8"])
+        .args(["-f", "lavfi"])
+        .args(["-i", "sine=frequency=440:duration=1"])
+        .args(["-pix_fmt", "yuv420p", "-c:a", "aac", "-y"])
+        .arg(&input)
+        .status()
+        .expect("failed to spawn ffmpeg");
+    assert!(status.success(), "ffmpeg failed to generate test clip with audio");
+
+    let output = unique_path("out_audio.mp4");
+    let (tx, rx) = mpsc::channel();
+    let input2 = input.clone();
+    let output2 = output.clone();
+    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, tx));
+
+    let mut saw_done = false;
+    let mut saw_error = None;
+    for msg in rx {
+        match msg {
+            PipelineMsg::Error(e) => saw_error = Some(e),
+            PipelineMsg::Done => saw_done = true,
+            _ => {}
+        }
+    }
+    handle.join().unwrap();
+    if let Some(e) = saw_error {
+        panic!("pipeline reported an error: {e}");
+    }
+    assert!(saw_done, "pipeline never sent Done");
+    assert!(output.exists(), "output file was not created");
+
+    let out = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "a:0"])
+        .args(["-show_entries", "stream=codec_type"])
+        .args(["-of", "default=noprint_wrappers=1"])
+        .arg(&output)
+        .output()
+        .expect("failed to spawn ffprobe");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("codec_type=audio"), "output has no audio stream: {text}");
+
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&output);
+}

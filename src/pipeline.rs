@@ -6,6 +6,7 @@ use ff::frame::Video as VideoFrame;
 use ff::media::Type as MediaType;
 use ff::software::scaling::{context::Context as Scaler, flag::Flags as ScaleFlags};
 use ff::Rescale;
+use rayon::prelude::*;
 use std::path::Path;
 use std::sync::mpsc::Sender;
 
@@ -13,6 +14,16 @@ pub enum PipelineMsg {
     Progress { current: u64, total: u64 },
     Log(String),
     Done,
+    Error(String),
+}
+
+/// One unit of demuxed/decoded work handed from the producer thread (demux +
+/// decode) to the consumer (scale + GPU DCT + encode + mux), preserving the
+/// original interleave order via the channel's FIFO delivery.
+enum WorkItem {
+    Video(VideoFrame),
+    Audio(ff::Packet),
+    Eof,
     Error(String),
 }
 
@@ -54,7 +65,9 @@ fn drain_encoder(
 }
 
 /// Deinterleaves a packed RGB24 frame's plane 0 into three f32 planes,
-/// respecting the frame's stride (linesize may exceed width*3).
+/// respecting the frame's stride (linesize may exceed width*3). Rows are
+/// independent (disjoint reads of `data`, disjoint writes into r/g/b), so
+/// this is parallelized over rows with rayon.
 fn split_rgb_planes(frame: &VideoFrame, width: u32, height: u32) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let (w, h) = (width as usize, height as usize);
     let stride = frame.stride(0);
@@ -62,34 +75,38 @@ fn split_rgb_planes(frame: &VideoFrame, width: u32, height: u32) -> (Vec<f32>, V
     let mut r = vec![0f32; w * h];
     let mut g = vec![0f32; w * h];
     let mut b = vec![0f32; w * h];
-    for y in 0..h {
-        let row = &data[y * stride..y * stride + w * 3];
-        for x in 0..w {
-            let i = y * w + x;
-            r[i] = row[x * 3] as f32;
-            g[i] = row[x * 3 + 1] as f32;
-            b[i] = row[x * 3 + 2] as f32;
-        }
-    }
+    r.par_chunks_mut(w)
+        .zip(g.par_chunks_mut(w))
+        .zip(b.par_chunks_mut(w))
+        .enumerate()
+        .for_each(|(y, ((r_row, g_row), b_row))| {
+            let row = &data[y * stride..y * stride + w * 3];
+            for x in 0..w {
+                r_row[x] = row[x * 3] as f32;
+                g_row[x] = row[x * 3 + 1] as f32;
+                b_row[x] = row[x * 3 + 2] as f32;
+            }
+        });
     (r, g, b)
 }
 
 /// Reassembles three f32 planes back into a packed RGB24 frame, respecting
-/// the destination frame's own stride.
+/// the destination frame's own stride. Rows are independent, same
+/// rayon-over-rows treatment as `split_rgb_planes`.
 fn join_rgb_planes(width: u32, height: u32, r: &[f32], g: &[f32], b: &[f32]) -> VideoFrame {
     let (w, h) = (width as usize, height as usize);
     let mut frame = VideoFrame::new(Pixel::RGB24, width, height);
     let stride = frame.stride(0);
     let data = frame.data_mut(0);
-    for y in 0..h {
+    data.par_chunks_mut(stride).take(h).enumerate().for_each(|(y, row)| {
         for x in 0..w {
             let i = y * w + x;
-            let o = y * stride + x * 3;
-            data[o] = r[i].round().clamp(0.0, 255.0) as u8;
-            data[o + 1] = g[i].round().clamp(0.0, 255.0) as u8;
-            data[o + 2] = b[i].round().clamp(0.0, 255.0) as u8;
+            let o = x * 3;
+            row[o] = r[i].round().clamp(0.0, 255.0) as u8;
+            row[o + 1] = g[i].round().clamp(0.0, 255.0) as u8;
+            row[o + 2] = b[i].round().clamp(0.0, 255.0) as u8;
         }
-    }
+    });
     frame
 }
 
@@ -249,76 +266,130 @@ fn run_inner(input_path: &Path, output_path: &Path, cutoff: f32, tx: &Sender<Pip
         ScaleFlags::BILINEAR,
     )?;
 
-    let mut frame_idx: i64 = 0;
+    // Producer/consumer split: demuxing and decoding (stateful, CPU-bound
+    // libavcodec work) run on a dedicated thread and feed a bounded channel,
+    // so decode of frame N+1 can overlap with this thread's scale + GPU DCT
+    // wait + encode of frame N instead of the two serializing on one thread
+    // (which is why the GPU previously sat idle during every scale/encode
+    // step). `libswscale`'s `Context` (`to_rgb`/`from_rgb`) is not `Send`,
+    // so scaling stays here on the consumer side; the channel's FIFO order
+    // preserves the original demux interleave for both video and audio, so
+    // no separate reordering step is needed.
+    //
+    // `ictx`/`decoder` are only moved into the producer closure below, not
+    // used again on this thread afterward.
+    let audio_in_time_base = audio_stream_index.map(|idx| ictx.stream(idx).unwrap().time_base());
+    let a_ost_time_base = audio_ost_index.map(|idx| octx.stream(idx).unwrap().time_base());
 
-    let mut process_decoded = |decoded: &VideoFrame,
-                                to_rgb: &mut Scaler,
-                                from_rgb: &mut Scaler,
-                                encoder: &mut ff::encoder::Video,
-                                octx: &mut ff::format::context::Output|
-     -> Result<()> {
-        let mut rgb = VideoFrame::empty();
-        to_rgb.run(decoded, &mut rgb)?;
+    let (work_tx, work_rx) = std::sync::mpsc::sync_channel::<WorkItem>(2);
+    let producer = std::thread::spawn(move || -> Result<()> {
+        let result = (|| -> Result<()> {
+            for (stream_in, mut packet) in ictx.packets() {
+                let in_index = stream_in.index();
+                if in_index == video_stream_index {
+                    decoder.send_packet(&packet)?;
+                    let mut decoded = VideoFrame::empty();
+                    loop {
+                        match decoder.receive_frame(&mut decoded) {
+                            Ok(()) => {
+                                if work_tx.send(WorkItem::Video(decoded)).is_err() {
+                                    return Ok(()); // consumer already stopped (errored)
+                                }
+                                decoded = VideoFrame::empty();
+                            }
+                            Err(e) if is_retry_or_eof(&e) => break,
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                } else if Some(in_index) == audio_stream_index {
+                    if let (Some(a_ost_index), Some(in_tb), Some(out_tb)) =
+                        (audio_ost_index, audio_in_time_base, a_ost_time_base)
+                    {
+                        packet.rescale_ts(in_tb, out_tb);
+                        packet.set_stream(a_ost_index);
+                        if work_tx.send(WorkItem::Audio(packet)).is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
 
-        let (r, g, b) = split_rgb_planes(&rgb, width, height);
-        let (r2, g2, b2) = gpu.process_rgb(&r, &g, &b, width, height, cutoff)?;
-        let rgb_out = join_rgb_planes(width, height, &r2, &g2, &b2);
-
-        let mut yuv = VideoFrame::empty();
-        from_rgb.run(&rgb_out, &mut yuv)?;
-        // Keep the decoded frame's own timeline (rescaled into the encoder's
-        // time base) instead of a synthetic zero-based counter, so video
-        // stays aligned with the audio passthrough's original timestamps
-        // (e.g. inputs with a nonzero stream start_time). `frame_idx` is
-        // only a fallback for frames with no pts, and is already expressed
-        // directly in enc_time_base units (1 tick = 1 frame), so unlike a
-        // real pts it must NOT be rescaled from the input's time_base.
-        let source_pts = match decoded.pts() {
-            Some(pts) => pts.rescale(time_base, enc_time_base),
-            None => frame_idx,
-        };
-        yuv.set_pts(Some(source_pts));
-        frame_idx += 1;
-
-        encoder.send_frame(&yuv)?;
-        drain_encoder(encoder, octx, video_ost_index, ost_time_base)?;
-
-        let _ = tx.send(PipelineMsg::Progress { current: frame_idx as u64, total: total_frames });
-        Ok(())
-    };
-
-    for (stream_in, mut packet) in ictx.packets() {
-        let in_index = stream_in.index();
-        if in_index == video_stream_index {
-            decoder.send_packet(&packet)?;
+            decoder.send_eof()?;
             let mut decoded = VideoFrame::empty();
             loop {
                 match decoder.receive_frame(&mut decoded) {
-                    Ok(()) => process_decoded(&decoded, &mut to_rgb, &mut from_rgb, &mut encoder, &mut octx)?,
+                    Ok(()) => {
+                        if work_tx.send(WorkItem::Video(decoded)).is_err() {
+                            return Ok(());
+                        }
+                        decoded = VideoFrame::empty();
+                    }
                     Err(e) if is_retry_or_eof(&e) => break,
                     Err(e) => return Err(e.into()),
                 }
             }
-        } else if Some(in_index) == audio_stream_index {
-            if let Some(a_ost_index) = audio_ost_index {
-                let a_ost_time_base = octx.stream(a_ost_index).unwrap().time_base();
-                packet.rescale_ts(stream_in.time_base(), a_ost_time_base);
-                packet.set_stream(a_ost_index);
+            Ok(())
+        })();
+
+        match &result {
+            Ok(()) => {
+                let _ = work_tx.send(WorkItem::Eof);
+            }
+            Err(e) => {
+                let _ = work_tx.send(WorkItem::Error(format!("{e:#}")));
+            }
+        }
+        result
+    });
+
+    let mut frame_idx: i64 = 0;
+    loop {
+        match work_rx.recv() {
+            Ok(WorkItem::Video(decoded)) => {
+                let mut rgb = VideoFrame::empty();
+                to_rgb.run(&decoded, &mut rgb)?;
+
+                let (r, g, b) = split_rgb_planes(&rgb, width, height);
+                let (r2, g2, b2) = gpu.process_rgb(&r, &g, &b, width, height, cutoff)?;
+                let rgb_out = join_rgb_planes(width, height, &r2, &g2, &b2);
+
+                let mut yuv = VideoFrame::empty();
+                from_rgb.run(&rgb_out, &mut yuv)?;
+                // Keep the decoded frame's own timeline (rescaled into the
+                // encoder's time base) instead of a synthetic zero-based
+                // counter, so video stays aligned with the audio
+                // passthrough's original timestamps (e.g. inputs with a
+                // nonzero stream start_time). `frame_idx` is only a
+                // fallback for frames with no pts, and is already expressed
+                // directly in enc_time_base units (1 tick = 1 frame), so
+                // unlike a real pts it must NOT be rescaled from the
+                // input's time_base.
+                let source_pts = match decoded.pts() {
+                    Some(pts) => pts.rescale(time_base, enc_time_base),
+                    None => frame_idx,
+                };
+                yuv.set_pts(Some(source_pts));
+                frame_idx += 1;
+
+                encoder.send_frame(&yuv)?;
+                drain_encoder(&mut encoder, &mut octx, video_ost_index, ost_time_base)?;
+
+                let _ = tx.send(PipelineMsg::Progress { current: frame_idx as u64, total: total_frames });
+            }
+            Ok(WorkItem::Audio(packet)) => {
                 packet.write_interleaved(&mut octx)?;
             }
+            Ok(WorkItem::Eof) => break,
+            Ok(WorkItem::Error(msg)) => bail!("{msg}"),
+            Err(_) => bail!("decode worker thread ended unexpectedly"),
         }
     }
 
-    decoder.send_eof()?;
-    let mut decoded = VideoFrame::empty();
-    loop {
-        match decoder.receive_frame(&mut decoded) {
-            Ok(()) => process_decoded(&decoded, &mut to_rgb, &mut from_rgb, &mut encoder, &mut octx)?,
-            Err(e) if is_retry_or_eof(&e) => break,
-            Err(e) => return Err(e.into()),
-        }
+    match producer.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => bail!("decode worker thread panicked"),
     }
-    drop(process_decoded);
 
     encoder.send_eof()?;
     drain_encoder(&mut encoder, &mut octx, video_ost_index, ost_time_base)?;
