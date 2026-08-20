@@ -3,7 +3,18 @@ use crate::dct_math::{dct_basis, transpose_square};
 use anyhow::{bail, Context, Result};
 use bytemuck::{Pod, Zeroable};
 use std::cell::RefCell;
+use std::time::Duration;
 use tracing::debug;
+
+/// Bound on a single `device.poll` wait. Large frames on the naive
+/// whole-frame shader (see `DctGpu` docs) can push one dispatch past the
+/// driver's TDR window, at which point the GPU is reset out from under
+/// this process; `wgpu::PollType::wait_indefinitely()` then blocks forever
+/// on a fence that will never signal, with both GPU and CPU sitting fully
+/// idle - confirmed reproducing this exact silent hang at 1920x1082
+/// (well past the 640x480 size this backend already warns about). A
+/// bounded wait turns that into a clean, reported error instead.
+const GPU_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
@@ -201,7 +212,7 @@ impl DctGpu {
     pub fn process_plane(&self, pixels: &[f32], width: u32, height: u32, cutoff: f32) -> Result<Vec<f32>> {
         self.encode_plane(0, pixels, width, height, cutoff)?;
         let rx = self.begin_read(0)?;
-        self.device.poll(wgpu::PollType::wait_indefinitely()).context("gpu poll failed")?;
+        self.poll_bounded()?;
         self.finish_read(0, rx)
     }
 
@@ -225,7 +236,7 @@ impl DctGpu {
         let rx0 = self.begin_read(0)?;
         let rx1 = self.begin_read(1)?;
         let rx2 = self.begin_read(2)?;
-        self.device.poll(wgpu::PollType::wait_indefinitely()).context("gpu poll failed")?;
+        self.poll_bounded()?;
         let r_out = self.finish_read(0, rx0)?;
         let g_out = self.finish_read(1, rx1)?;
         let b_out = self.finish_read(2, rx2)?;
@@ -335,6 +346,21 @@ impl DctGpu {
         self.queue.submit(Some(encoder.finish()));
 
         Ok(())
+    }
+
+    /// Blocks until the most recent submission completes, or `GPU_POLL_TIMEOUT`
+    /// elapses - whichever comes first. A bounded wait instead of
+    /// `wait_indefinitely()` so a driver-level GPU reset (Windows TDR, most
+    /// likely at resolutions well beyond the naive-shader warning threshold)
+    /// surfaces as a clear error instead of hanging this thread forever.
+    fn poll_bounded(&self) -> Result<()> {
+        match self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(GPU_POLL_TIMEOUT) }) {
+            Ok(_) => Ok(()),
+            Err(wgpu::PollError::Timeout) => bail!(
+                "GPU did not respond within {GPU_POLL_TIMEOUT:?} - likely a driver reset (Windows TDR) from a too-slow DCT dispatch at this resolution; try --backend cpu or a lower resolution"
+            ),
+            Err(e) => Err(e).context("gpu poll failed"),
+        }
     }
 
     /// Issues the async map request for `channel`'s previously-`encode_plane`'d
