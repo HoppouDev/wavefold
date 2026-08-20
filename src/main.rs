@@ -1,3 +1,11 @@
+// Suppresses the console window Windows otherwise pops up for every launch
+// (double-clicking the exe, the Start Menu shortcut, etc.) since this is
+// primarily a GUI app there. `main()` reattaches to the parent console (if
+// any) up front so `wavefold encode ...` run from an existing terminal
+// still prints normally - only launches with no parent console (double
+// click) end up with no console at all, which is what we want.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod ui;
 
 use clap::{Parser, Subcommand};
@@ -42,6 +50,16 @@ enum Command {
 }
 
 fn main() {
+    // Re-attach to whatever console launched us (e.g. cmd.exe/PowerShell),
+    // if any - `windows_subsystem = "windows"` above means we start with no
+    // console at all, so without this `encode` output would silently go
+    // nowhere when run from an existing terminal. No-op (and no console) on
+    // a double-click launch, which has no parent console to attach to.
+    #[cfg(windows)]
+    unsafe {
+        let _ = windows::Win32::System::Console::AttachConsole(windows::Win32::System::Console::ATTACH_PARENT_PROCESS);
+    }
+
     tracing_subscriber::fmt::init();
     match Cli::parse().command.unwrap_or(Command::Gui) {
         Command::Gui => {
