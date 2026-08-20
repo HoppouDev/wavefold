@@ -403,13 +403,41 @@ same basis math `dct_math.rs` → (GPU only) `shader.wgsl`.
 
 - **`src/backends/media_foundation.rs`** — the only `MediaBackend` impl on
   Windows (`cfg(windows)`), built on `IMFSourceReader`/`IMFSinkWriter`
-  instead of `gst::Pipeline`. Verified by cross-compiling the *whole*
-  crate (GUI included) for `x86_64-pc-windows-msvc` via `cargo xwin`
-  (confirms real linkage against `mfplat.dll`/`mfreadwrite.dll`/
-  `ole32.dll`, not just that it type-checks) and exercising the actual
-  decode/encode API calls under Wine's `winegstreamer`-backed MF
-  implementation — no real Windows machine was available to verify
-  end-to-end.
+  instead of `gst::Pipeline`. Originally verified only by cross-compiling
+  the *whole* crate (GUI included) for `x86_64-pc-windows-msvc` via
+  `cargo xwin` and exercising decode/encode under Wine's
+  `winegstreamer`-backed MF implementation, with no real Windows machine
+  available end-to-end; `tests/integration.rs` has since run for real on
+  Windows 11 (real GPU, real built-in codec MFTs) and surfaced three
+  genuine platform-specific gaps, all confirmed and now tolerated at the
+  test level rather than treated as wavefold bugs:
+  - Windows' built-in H.264 encoder MFT rejects `SetInputMediaType` with
+    0xC00D36B4 below some resolution floor between 32 and 48px on either
+    axis (confirmed across RGB32/NV12 input subtypes alike — a genuine
+    minimum-size limitation in that MFT, not a media-type construction
+    bug). `tests/integration.rs`'s small fixtures are 64x64, not smaller.
+  - Software `Codec::Av1` has no encoder MFT on Windows at all — only a
+    decoder ships ("AV1 Video Extensions") — confirmed via
+    `SetInputMediaType` failing with 0xC00D5212 ("no suitable transform").
+    `Codec::Av1Hardware` is unaffected (a real GPU's own AV1 hardware
+    encoder MFT, if present, registers independently).
+  - Windows' built-in MP4 sink negotiates raw PCM audio passthrough fine
+    (`AddStream`/`SetInputMediaType` both succeed) but fails at
+    `Finalize` with 0xC00D4A45 ("required headers were not provided") —
+    its documented MP4 audio support is essentially AAC-only, so it can't
+    actually mux PCM despite accepting the type.
+  - Separately (not a `wavefold`-code issue, just a fixture footgun):
+    ffmpeg-generated synthetic clips need `-pix_fmt yuv420p` explicitly —
+    without it `libx264` defaults to High 4:4:4 Predictive/yuv444p for
+    `testsrc`'s native chroma sampling, which Windows' H.264 decoder MFT
+    can't decode (`ReadSample` fails with a generic "CopyDecodedFrame
+    failed", 0x80004005). And Windows' Matroska source has been observed
+    to misreport `MF_MT_FRAME_RATE` by exactly half for at least one
+    ffmpeg-muxed mkv fixture (confirmed on both the native and
+    RGB32-negotiated video type, independent of H.264 VUI timing info,
+    and cross-checked against `ffprobe`'s correct `r_frame_rate` on the
+    identical file) — `tests/integration.rs`'s total-frame-estimate
+    assertion is loosened accordingly on Windows.
   - **`codec_target(codec)`** → `{ subtype: GUID, hardware: bool }`:
     `MFVideoFormat_H264`/`_HEVC`/`_VP90`/`_AV1` for the subtype,
     `hardware` feeds `MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS` on the sink
