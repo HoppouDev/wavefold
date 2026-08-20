@@ -1,0 +1,465 @@
+//! Windows-only `MediaBackend` built on Media Foundation
+//! (`IMFSourceReader`/`IMFSinkWriter`) instead of GStreamer — Windows has
+//! no system package manager providing GStreamer the way Linux distros do,
+//! but Media Foundation ships with the OS itself, so this backend needs no
+//! bundled runtime at all (see `codec.rs`/`media_backend.rs` for why
+//! `backends::gstreamer` is `cfg(not(windows))` and this is `cfg(windows)`
+//! — never both compiled into the same binary).
+//!
+//! API shape verified against the real `windows` crate bindings compiled
+//! for the actual `x86_64-pc-windows-msvc` target (via `cargo xwin`, which
+//! cross-links against real Windows SDK import libraries) and exercised at
+//! runtime under Wine's `winegstreamer`-backed Media Foundation
+//! implementation: `IMFSourceReader` decode to `MFVideoFormat_RGB32`
+//! (confirmed real BGRA32 pixel data, correct frame count, needs
+//! `MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING` or negotiation fails with
+//! `MF_E_INVALIDMEDIATYPE`) and `IMFSinkWriter` H264 setup
+//! (`AddStream`/`SetInputMediaType`/`BeginWriting`/`WriteSample` all
+//! confirmed to succeed; `Finalize` returned `E_NOTIMPL` under Wine's
+//! encoder/mux implementation specifically, not something attributable to
+//! this code) — real Windows was not available to verify end-to-end
+//! either way.
+
+use crate::codec::Codec;
+use crate::dct_backend::DctBackend;
+use crate::media_backend::{MediaBackend, PipelineMsg};
+use anyhow::{anyhow, Context, Result};
+use rayon::prelude::*;
+use std::os::windows::ffi::OsStrExt;
+use std::path::Path;
+use tokio::sync::mpsc::UnboundedSender as Sender;
+use tracing::{info, warn};
+use windows::core::{Interface, GUID, PCWSTR};
+use windows::Win32::Media::MediaFoundation::*;
+use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+
+pub struct MediaFoundationBackend;
+
+impl MediaBackend for MediaFoundationBackend {
+    fn run(
+        &self,
+        input: &Path,
+        output: &Path,
+        cutoff: f32,
+        codec: Codec,
+        dct: Box<dyn DctBackend>,
+        tx: Sender<PipelineMsg>,
+    ) -> Result<()> {
+        run_inner(input, output, cutoff, codec, dct, &tx)
+    }
+}
+
+/// Which MF video subtype a `Codec` encodes into, and whether to allow
+/// (not force) a hardware MFT via `MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS`
+/// - mirrors `backends::gstreamer`'s `codec_profile`. Unlike GStreamer's
+/// explicit element-name selection, Media Foundation's transcode API picks
+/// whichever registered encoder MFT matches the requested subtype; there's
+/// no equivalent of "prefer x264enc specifically" - just "software only"
+/// vs. "hardware allowed."
+struct CodecTarget {
+    subtype: GUID,
+    hardware: bool,
+}
+
+fn codec_target(codec: Codec) -> CodecTarget {
+    let subtype = match codec {
+        Codec::H264 | Codec::H264Hardware => MFVideoFormat_H264,
+        Codec::H265 | Codec::H265Hardware => MFVideoFormat_HEVC,
+        // Windows ships an MF *decoder* for VP9 (the "VP9 Video
+        // Extensions") but no built-in *encoder* MFT - the same
+        // no-VP9-hardware-encode-style gap `backends::gstreamer` already
+        // documents for `vavp9enc`. Kept selectable; `AddStream`/
+        // `SetInputMediaType` below fail cleanly with an MF error code if
+        // nothing registered can encode it, same tolerant-skip shape
+        // `tests/integration.rs` already uses for the GStreamer backend.
+        Codec::Vp9 | Codec::Vp9Hardware => MFVideoFormat_VP90,
+        Codec::Av1 | Codec::Av1Hardware => MFVideoFormat_AV1,
+    };
+    CodecTarget { subtype, hardware: codec.is_hardware() }
+}
+
+fn to_wide_null(path: &Path) -> Vec<u16> {
+    path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+}
+
+/// Finds the real (0-based) index of the first stream whose major type is
+/// `major_type`. `IMFSourceReader::ReadSample`'s `pdwStreamIndex` out-param
+/// is always a genuine per-stream index - unlike the
+/// `MF_SOURCE_READER_FIRST_*_STREAM` pseudo-constants, which are valid only
+/// as *inputs* to methods like `SetCurrentMediaType`/`GetNativeMediaType`
+/// ("whichever stream turns out to be the first video/audio one"), never as
+/// something to compare a real stream index against.
+fn find_stream_index(reader: &IMFSourceReader, major_type: &GUID) -> Result<Option<u32>> {
+    let mut i = 0u32;
+    loop {
+        let native = match unsafe { reader.GetNativeMediaType(i, 0) } {
+            Ok(t) => t,
+            Err(e) if e.code() == MF_E_INVALIDSTREAMNUMBER => return Ok(None),
+            Err(e) => return Err(e).context("failed to enumerate source streams"),
+        };
+        if unsafe { native.GetGUID(&MF_MT_MAJOR_TYPE) }.ok().as_ref() == Some(major_type) {
+            return Ok(Some(i));
+        }
+        i += 1;
+    }
+}
+
+/// RAII guards for `CoInitializeEx`/`MFStartup` - both need a matching
+/// uninit/shutdown call on every exit path, same reasoning as
+/// `backends::gstreamer`'s `pipeline.set_state(Null)` needing to run on
+/// every exit path (an early `?` skipping it would leak the COM apartment
+/// / MF platform state for the process's remaining lifetime).
+struct ComGuard;
+impl Drop for ComGuard {
+    fn drop(&mut self) {
+        unsafe { CoUninitialize() };
+    }
+}
+
+struct MfGuard;
+impl Drop for MfGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = MFShutdown();
+        }
+    }
+}
+
+/// Deinterleaves a packed BGRA32 frame into three f32 planes (dropping
+/// alpha - Media Foundation's `MFVideoFormat_RGB32` is always opaque for
+/// this use case), honoring `stride` (from `IMF2DBuffer::Lock2D`, which
+/// can exceed `width*4` for padding, and can be *negative* for a
+/// bottom-up DIB - the classic Windows bitmap convention `MFVideoFormat_
+/// RGB32` inherits). Rows are independent, same rayon-over-rows treatment
+/// as `backends::gstreamer`'s `split_rgb_planes`.
+fn split_bgra_planes(data: &[u8], width: u32, height: u32, stride: i32) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let (w, h) = (width as usize, height as usize);
+    let row_bytes = stride.unsigned_abs() as usize;
+    let mut r = vec![0f32; w * h];
+    let mut g = vec![0f32; w * h];
+    let mut b = vec![0f32; w * h];
+    r.par_chunks_mut(w).zip(g.par_chunks_mut(w)).zip(b.par_chunks_mut(w)).enumerate().for_each(|(y, ((r_row, g_row), b_row))| {
+        // Negative stride: row 0 of the image is the *last* row in `data`.
+        let src_y = if stride < 0 { h - 1 - y } else { y };
+        let row = &data[src_y * row_bytes..src_y * row_bytes + w * 4];
+        for x in 0..w {
+            b_row[x] = row[x * 4] as f32;
+            g_row[x] = row[x * 4 + 1] as f32;
+            r_row[x] = row[x * 4 + 2] as f32;
+        }
+    });
+    (r, g, b)
+}
+
+/// Reassembles three f32 planes into a top-down packed BGRA32 buffer
+/// (`stride == width*4`, always positive - this is a fresh buffer this
+/// backend allocates itself, so there's no inherited orientation/padding
+/// to respect the way `split_bgra_planes` must for the source's buffer).
+fn join_bgra_planes(width: u32, height: u32, r: &[f32], g: &[f32], b: &[f32]) -> Vec<u8> {
+    let (w, h) = (width as usize, height as usize);
+    let mut out = vec![0u8; w * h * 4];
+    out.par_chunks_mut(w * 4).take(h).enumerate().for_each(|(y, row)| {
+        for x in 0..w {
+            let i = y * w + x;
+            let o = x * 4;
+            row[o] = b[i].round().clamp(0.0, 255.0) as u8;
+            row[o + 1] = g[i].round().clamp(0.0, 255.0) as u8;
+            row[o + 2] = r[i].round().clamp(0.0, 255.0) as u8;
+            row[o + 3] = 255;
+        }
+    });
+    out
+}
+
+/// Reads one `IMFSample`'s single buffer out as bytes + stride, via
+/// `IMF2DBuffer::Lock2D` when the buffer supports it (the correct,
+/// stride-aware way to read image data - falls back to
+/// `IMFMediaBuffer::Lock`, treating it as tightly packed, for the rare
+/// buffer that doesn't implement `IMF2DBuffer`).
+unsafe fn read_sample_bgra(sample: &IMFSample, width: u32) -> Result<(Vec<u8>, i32)> {
+    let buffer = sample.ConvertToContiguousBuffer().context("failed to get contiguous sample buffer")?;
+    if let Ok(buffer_2d) = buffer.cast::<IMF2DBuffer>() {
+        let mut scanline0: *mut u8 = std::ptr::null_mut();
+        let mut pitch: i32 = 0;
+        buffer_2d.Lock2D(&mut scanline0, &mut pitch).context("IMF2DBuffer::Lock2D failed")?;
+        let row_bytes = pitch.unsigned_abs() as usize;
+        let height = buffer.GetCurrentLength().context("failed to get buffer length")? / (row_bytes as u32);
+        let data = std::slice::from_raw_parts(scanline0, row_bytes * height as usize).to_vec();
+        let _ = buffer_2d.Unlock2D();
+        Ok((data, pitch))
+    } else {
+        let mut data_ptr: *mut u8 = std::ptr::null_mut();
+        let mut cur_len: u32 = 0;
+        buffer.Lock(&mut data_ptr, None, Some(&mut cur_len)).context("IMFMediaBuffer::Lock failed")?;
+        let data = std::slice::from_raw_parts(data_ptr, cur_len as usize).to_vec();
+        let _ = buffer.Unlock();
+        Ok((data, (width * 4) as i32))
+    }
+}
+
+fn run_inner(
+    input_path: &Path,
+    output_path: &Path,
+    cutoff: f32,
+    codec: Codec,
+    dct: Box<dyn DctBackend>,
+    tx: &Sender<PipelineMsg>,
+) -> Result<()> {
+    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok().context("failed to initialize COM")?;
+    let _com_guard = ComGuard;
+    unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.context("failed to initialize Media Foundation")?;
+    let _mf_guard = MfGuard;
+
+    let result = encode(input_path, output_path, cutoff, codec, dct, tx);
+    if result.is_err() {
+        // `MFCreateSinkWriterFromURL` opens (creates/truncates) the output
+        // file as part of sink-writer creation, independent of whether the
+        // rest of the encode ever succeeds - so a failed encode can leave a
+        // zero-byte/partial output file behind unless it's cleaned up here,
+        // same reasoning as `backends::gstreamer`'s filesink cleanup.
+        let _ = std::fs::remove_file(output_path);
+    }
+    result
+}
+
+fn encode(
+    input_path: &Path,
+    output_path: &Path,
+    cutoff: f32,
+    codec: Codec,
+    dct: Box<dyn DctBackend>,
+    tx: &Sender<PipelineMsg>,
+) -> Result<()> {
+    info!(path = %input_path.display(), "opening input");
+    let _ = tx.send(PipelineMsg::Log("opening input...".into()));
+
+    let target = codec_target(codec);
+
+    // --- source: decode the first video stream to top-down BGRA32 ---
+    let in_wide = to_wide_null(input_path);
+    let reader = unsafe {
+        let mut attrs = None;
+        MFCreateAttributes(&mut attrs, 1).context("MFCreateAttributes failed")?;
+        let attrs = attrs.context("MFCreateAttributes returned no attributes")?;
+        // Without this, requesting RGB32 output fails with
+        // MF_E_INVALIDMEDIATYPE - confirmed directly (see module doc
+        // comment). This is what lets the source reader insert whatever
+        // colorspace-convert MFT the native format needs.
+        attrs.SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1).context("failed to enable video processing")?;
+        MFCreateSourceReaderFromURL(PCWSTR(in_wide.as_ptr()), &attrs)
+    }
+    .with_context(|| format!("failed to open input {}", input_path.display()))?;
+
+    let rgb_type = unsafe {
+        let t = MFCreateMediaType().context("failed to create media type")?;
+        t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+        t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)?;
+        t
+    };
+    unsafe { reader.SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32, None, &rgb_type) }
+        .context("input has no video stream Media Foundation can decode to RGB32")?;
+
+    // `ReadSample`'s `pdwStreamIndex` output is a real stream index, so the
+    // main loop below needs the video stream's actual index, not the
+    // `MF_SOURCE_READER_FIRST_VIDEO_STREAM` selector used above.
+    let video_stream_index =
+        find_stream_index(&reader, &MFMediaType_Video)?.context("could not determine the real index of the negotiated video stream")?;
+
+    let video_type = unsafe { reader.GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32) }
+        .context("failed to read negotiated video type")?;
+    let frame_size = unsafe { video_type.GetUINT64(&MF_MT_FRAME_SIZE) }.context("video type has no frame size")?;
+    let (width, height) = ((frame_size >> 32) as u32, (frame_size & 0xFFFF_FFFF) as u32);
+    let frame_rate = unsafe { video_type.GetUINT64(&MF_MT_FRAME_RATE) }.unwrap_or((30u64 << 32) | 1);
+    let (fps_num, fps_den) = ((frame_rate >> 32) as u32, (frame_rate & 0xFFFF_FFFF).max(1) as u32);
+    let fps = fps_num as f64 / fps_den as f64;
+
+    info!(width, height, "decoded input parameters");
+    let _ = tx.send(PipelineMsg::Log(format!("{width}x{height} @ {fps:.3} fps, cutoff={cutoff:.3}")));
+    if (width as u64) * (height as u64) > 640 * 480 {
+        warn!(width, height, "resolution is large for a whole-frame DCT; expect this to be slow");
+        let _ = tx.send(PipelineMsg::Log(
+            "warning: this resolution is large for a whole-frame DCT (cost grows ~quadratically); expect this to be slow".into(),
+        ));
+    }
+
+    // Best-effort total-frame estimate for progress reporting, same
+    // tolerant "stays 0 (unknown) if unavailable" fallback as
+    // `backends::gstreamer`'s duration-query handling.
+    let total_frames = unsafe { reader.GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &MF_PD_DURATION) }
+        .ok()
+        .and_then(|pv| duration_100ns(&pv))
+        .map(|hns| ((hns as f64 / 10_000_000.0) * fps).round() as u64)
+        .unwrap_or(0);
+
+    // --- sink: encode into `codec`, container inferred from the output
+    // extension by Media Foundation's own byte-stream-handler resolution
+    // (same idea as `backends::gstreamer`'s extension-based muxer choice,
+    // but MF only reliably ships handlers for mp4/mov/asf - unlike
+    // GStreamer's `matroskamux` fallback, there's no built-in non-mp4
+    // container to fall back to here, so a `.mkv` output just fails
+    // cleanly with whatever error MF gives for an unresolvable
+    // byte-stream handler). ---
+    let out_wide = to_wide_null(output_path);
+    let sink_attrs = unsafe {
+        let mut attrs = None;
+        MFCreateAttributes(&mut attrs, 1).context("MFCreateAttributes failed")?;
+        let attrs = attrs.context("MFCreateAttributes returned no attributes")?;
+        attrs
+            .SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, target.hardware as u32)
+            .context("failed to set hardware-transform preference")?;
+        attrs
+    };
+    let writer = unsafe { MFCreateSinkWriterFromURL(PCWSTR(out_wide.as_ptr()), None, &sink_attrs) }
+        .with_context(|| format!("failed to open output {}", output_path.display()))?;
+
+    let out_type = unsafe {
+        let t = MFCreateMediaType().context("failed to create media type")?;
+        t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+        t.SetGUID(&MF_MT_SUBTYPE, &target.subtype)?;
+        t.SetUINT32(&MF_MT_AVG_BITRATE, 4_000_000)?;
+        t.SetUINT64(&MF_MT_FRAME_SIZE, frame_size)?;
+        t.SetUINT64(&MF_MT_FRAME_RATE, frame_rate)?;
+        t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+        t
+    };
+    let stream_index = unsafe { writer.AddStream(&out_type) }
+        .with_context(|| format!("no encoder registered for {codec} on this system"))?;
+
+    let in_type = unsafe {
+        let t = MFCreateMediaType().context("failed to create media type")?;
+        t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+        t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)?;
+        t.SetUINT64(&MF_MT_FRAME_SIZE, frame_size)?;
+        t.SetUINT64(&MF_MT_FRAME_RATE, frame_rate)?;
+        t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+        t
+    };
+    unsafe { writer.SetInputMediaType(stream_index, &in_type, None) }.context("failed to negotiate encoder input type")?;
+
+    // Audio passthrough: if the input has an audio stream, add it to the
+    // sink writer with its *native* (still-encoded) type - no decode/
+    // re-encode - same stream-copy behavior as `backends::gstreamer`'s
+    // `autoplug-continue` audio handling.
+    let audio_stream_index = setup_audio_passthrough(&reader, &writer).context("failed to set up audio passthrough")?;
+
+    unsafe { writer.BeginWriting() }.context("failed to start writing output")?;
+
+    let mut frame_idx = 0u64;
+    let mut pts_100ns = 0i64;
+    let frame_duration_100ns = (10_000_000.0 / fps).round() as i64;
+
+    loop {
+        let mut flags = 0u32;
+        let mut stream_idx = 0u32;
+        let mut sample: Option<IMFSample> = None;
+        unsafe {
+            reader.ReadSample(
+                MF_SOURCE_READER_ANY_STREAM.0 as u32,
+                0,
+                Some(&mut stream_idx),
+                Some(&mut flags),
+                None,
+                Some(&mut sample),
+            )
+        }
+        .context("failed to read a sample")?;
+
+        if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 && stream_idx == video_stream_index {
+            break;
+        }
+        let Some(sample) = sample else { continue };
+
+        if Some(stream_idx) == audio_stream_index {
+            unsafe { writer.WriteSample(1, &sample) }.context("failed to write passthrough audio sample")?;
+            continue;
+        }
+        if stream_idx != video_stream_index {
+            continue;
+        }
+
+        let (bgra, stride) = unsafe { read_sample_bgra(&sample, width) }?;
+        let (r, g, b) = split_bgra_planes(&bgra, width, height, stride);
+        let (r2, g2, b2) = dct.process_rgb(&r, &g, &b, width, height, cutoff)?;
+        let out_bytes = join_bgra_planes(width, height, &r2, &g2, &b2);
+
+        let out_sample = unsafe {
+            let buffer = MFCreateMemoryBuffer(out_bytes.len() as u32).context("failed to allocate output buffer")?;
+            let mut dest: *mut u8 = std::ptr::null_mut();
+            buffer.Lock(&mut dest, None, None).context("failed to lock output buffer")?;
+            std::ptr::copy_nonoverlapping(out_bytes.as_ptr(), dest, out_bytes.len());
+            buffer.Unlock().context("failed to unlock output buffer")?;
+            buffer.SetCurrentLength(out_bytes.len() as u32).context("failed to set output buffer length")?;
+
+            let out_sample = MFCreateSample().context("failed to create output sample")?;
+            out_sample.AddBuffer(&buffer).context("failed to attach output buffer")?;
+            out_sample.SetSampleTime(pts_100ns).context("failed to set sample time")?;
+            out_sample.SetSampleDuration(frame_duration_100ns).context("failed to set sample duration")?;
+            out_sample
+        };
+        unsafe { writer.WriteSample(stream_index, &out_sample) }.context("failed to write encoded sample")?;
+        pts_100ns += frame_duration_100ns;
+
+        frame_idx += 1;
+        let _ = tx.send(PipelineMsg::Progress { current: frame_idx, total: total_frames });
+    }
+
+    unsafe { writer.Finalize() }.context("failed to finalize output")?;
+
+    info!(frames = frame_idx, path = %output_path.display(), "encode complete");
+    let _ = tx.send(PipelineMsg::Log(format!("wrote {frame_idx} frames to {}", output_path.display())));
+    let _ = tx.send(PipelineMsg::Done);
+    Ok(())
+}
+
+/// Extracts a `VT_UI8` `PROPVARIANT` (what `MF_PD_DURATION` is documented
+/// to be) as its raw 100ns-tick value, or `None` for anything else -
+/// reading the wrong union field of an unrelated variant type would be UB,
+/// so the `vt` tag is checked first.
+fn duration_100ns(pv: &windows::core::PROPVARIANT) -> Option<i64> {
+    const VT_UI8: u16 = 21;
+    unsafe {
+        let raw = pv.as_raw();
+        if raw.Anonymous.Anonymous.vt == VT_UI8 {
+            Some(raw.Anonymous.Anonymous.Anonymous.uhVal as i64)
+        } else {
+            None
+        }
+    }
+}
+
+/// Adds the input's first audio stream (if any) to `writer` with its
+/// native, still-encoded media type - pure stream copy, no decode/
+/// re-encode - and returns which `IMFSourceReader` stream index it came
+/// from so the main read loop can route samples from it straight to
+/// `writer` untouched. Returns `Ok(None)` if the input has no audio
+/// stream, same "may simply never get used" tolerance as
+/// `backends::gstreamer`'s `aud_queue`.
+fn setup_audio_passthrough(reader: &IMFSourceReader, writer: &IMFSinkWriter) -> Result<Option<u32>> {
+    let Some(audio_stream_index) = find_stream_index(reader, &MFMediaType_Audio)? else {
+        return Ok(None); // no audio stream
+    };
+    let native_type = unsafe { reader.GetNativeMediaType(audio_stream_index, 0) }.context("failed to read native audio type")?;
+    unsafe { reader.SetStreamSelection(audio_stream_index, true) }.context("failed to select audio stream")?;
+    let audio_out_stream = unsafe { writer.AddStream(&native_type) }.context("failed to add passthrough audio stream to output")?;
+    unsafe { writer.SetInputMediaType(audio_out_stream, &native_type, None) }.context("failed to set passthrough audio input type")?;
+    if audio_out_stream != 1 {
+        return Err(anyhow!("expected passthrough audio to land on sink writer stream 1, got {audio_out_stream}"));
+    }
+    Ok(Some(audio_stream_index))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn errors_on_missing_input() {
+        let result = super::run_inner(
+            std::path::Path::new("Z:\\nonexistent\\wavefold_test_input.mp4"),
+            std::path::Path::new("Z:\\tmp\\wavefold_test_output_never_created.mp4"),
+            0.6,
+            crate::codec::Codec::H264,
+            Box::new(crate::cpu::DctCpu::new()),
+            &tokio::sync::mpsc::unbounded_channel().0,
+        );
+        assert!(result.is_err());
+    }
+}

@@ -1,8 +1,9 @@
 mod ui;
 
 use clap::{Parser, Subcommand};
+use wavefold::codec::Codec;
 use wavefold::dct_backend::ComputeBackend;
-use wavefold::encoders::EncoderChoice;
+use wavefold::media_backend::MediaBackendChoice;
 use wavefold::pipeline::{self, PipelineMsg};
 use std::io::Write;
 use std::path::PathBuf;
@@ -28,17 +29,20 @@ enum Command {
         #[arg(long, default_value_t = 0.6)]
         cutoff: f32,
         /// Output video encoder
-        #[arg(long, value_enum, default_value_t = EncoderChoice::H264)]
-        encoder: EncoderChoice,
+        #[arg(long, value_enum, default_value_t = Codec::H264)]
+        encoder: Codec,
         /// DCT compute backend. `cpu` needs no GPU at all (e.g. for CI runners).
         #[arg(long, value_enum, default_value_t = ComputeBackend::Gpu)]
         backend: ComputeBackend,
+        /// Decode/encode implementation. Only one exists today; this is the
+        /// selector for when another is added.
+        #[arg(long, value_enum, default_value_t = MediaBackendChoice::ALL[0])]
+        media_backend: MediaBackendChoice,
     },
 }
 
 fn main() {
     tracing_subscriber::fmt::init();
-    use_bundled_gstreamer_plugins_if_present();
     match Cli::parse().command.unwrap_or(Command::Gui) {
         Command::Gui => {
             if let Err(e) = run_gui() {
@@ -46,25 +50,8 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Encode { input, output, cutoff, encoder, backend } => {
-            run_encode(input, output, cutoff, encoder, backend);
-        }
-    }
-}
-
-/// The Windows release (installer and .zip) bundles the GStreamer runtime
-/// and its plugins in a `gstreamer-1.0` folder next to `wavefold.exe`,
-/// since Windows has no system package manager providing it the way
-/// Linux distros do. `gst::init()` only picks up plugins from
-/// `GST_PLUGIN_PATH`/the system registry, so point it at that folder
-/// when present. No-op on Linux/macOS, where GStreamer is expected to
-/// already be installed system-wide (see README).
-fn use_bundled_gstreamer_plugins_if_present() {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(plugin_dir) = exe.parent().map(|dir| dir.join("gstreamer-1.0")) {
-            if plugin_dir.is_dir() {
-                std::env::set_var("GST_PLUGIN_PATH", plugin_dir);
-            }
+        Command::Encode { input, output, cutoff, encoder, backend, media_backend } => {
+            run_encode(input, output, cutoff, encoder, backend, media_backend);
         }
     }
 }
@@ -89,9 +76,9 @@ fn load_icon() -> iced::window::Icon {
         .expect("embedded app icon has valid dimensions")
 }
 
-fn run_encode(input: PathBuf, output: PathBuf, cutoff: f32, encoder: EncoderChoice, backend: ComputeBackend) {
+fn run_encode(input: PathBuf, output: PathBuf, cutoff: f32, encoder: Codec, backend: ComputeBackend, media_backend: MediaBackendChoice) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let handle = std::thread::spawn(move || pipeline::run(&input, &output, cutoff, encoder, backend, tx));
+    let handle = std::thread::spawn(move || pipeline::run(&input, &output, cutoff, encoder, backend, media_backend, tx));
 
     let mut had_error = false;
     while let Some(msg) = rx.blocking_recv() {

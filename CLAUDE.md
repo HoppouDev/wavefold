@@ -13,8 +13,15 @@ or VAAPI hardware — audio pass through untouched. Visual effect tool, not
 real codec — point is ringing/ghosting artifact DCT cutoff produce, not
 compression efficiency.
 
-Media I/O (`pipeline.rs`/`encoders.rs`) built on **GStreamer**
-(`gstreamer`/`gstreamer-app`/`gstreamer-video`), not FFmpeg — replaced
+Media I/O behind `MediaBackend` trait (`media_backend.rs`) — decode/encode
+implementation swappable, platform-gated: `backends::gstreamer`
+(`cfg(not(windows))`) built on **GStreamer**
+(`gstreamer`/`gstreamer-app`/`gstreamer-video`) on Linux/macOS,
+`backends::media_foundation` (`cfg(windows)`) built on Windows's own
+**Media Foundation** (`windows` crate) on Windows — no system package
+manager there to install GStreamer from, but Media Foundation ships with
+the OS, so that backend needs no bundled runtime at all. Exactly one of
+the two is ever compiled into a given binary. GStreamer, not FFmpeg — replaced
 earlier `ffmpeg-next`-based implementation specifically because
 `ffmpeg-sys-next` declares `links = "ffmpeg"`, and Cargo hard-bans two
 versions of `links`-crate coexisting one dependency graph — made
@@ -32,7 +39,7 @@ wavefold                                       # launch the iced GUI (default wi
 wavefold gui                                   # same, explicit
 wavefold encode <in> <out> [--cutoff F] [--encoder ...] [--backend gpu|cpu]  # headless, no display server needed
 cargo check                                    # fast typecheck, iterate with this first
-cargo test --release                           # unit tests (gpu.rs, cpu.rs, dct_math.rs, pipeline.rs) + tests/integration.rs
+cargo test --release                           # unit tests (gpu.rs, cpu.rs, dct_math.rs, backends/gstreamer.rs) + tests/integration.rs
 cargo test --release <name>                    # run a single test by substring, e.g. `cargo test --release roundtrip`
 ```
 
@@ -57,7 +64,10 @@ defaults if needed.
 
 ### System dependencies
 
-`gstreamer-sys`/`gstreamer-app-sys`/`gstreamer-video-sys` bind against
+Linux/macOS only (`backends::gstreamer`) — Windows (`backends::
+media_foundation`) needs nothing beyond the MSVC toolchain, Media
+Foundation ships with the OS. `gstreamer-sys`/`gstreamer-app-sys`/
+`gstreamer-video-sys` bind against
 system's libgstreamer-1.0/libgstapp-1.0/libgstvideo-1.0 via `pkg-config` —
 unlike old ffmpeg-next setup, no major-version-must-match constraint
 (GStreamer's C ABI stable since 1.0), so any reasonably current GStreamer
@@ -66,13 +76,13 @@ dev install works. From-scratch build need: `pkg-config`,
 naming; `gstreamer`/`gst-plugins-base` on Arch) for headers, **plus actual
 plugins at runtime** — `gst-plugins-good` (`vp9enc`), `gst-plugins-bad`
 (`x265enc`, `av1enc`, `va` VAAPI plugin), `gst-plugins-ugly` (`x264enc`) —
-`EncoderChoice` whose element not installed fails at pipeline-construction
+`Codec` whose element not installed fails at pipeline-construction
 time, clear error (`gst::
 ElementFactory::make` returning `None`), not
 compile time. Also install `gstreamer1.0-libav` (or distro equivalent) for
 broad-codec *decoding* — this repo's own dev/CI environment needed it,
 default `openh264dec` decoder can't handle every H.264 profile FFmpeg
-itself produce (see `pipeline.rs`'s decode-side notes below). `va`-plugin
+itself produce (see `backends/gstreamer.rs`'s decode-side notes below). `va`-plugin
 VAAPI elements (`vah264enc`/`vah265enc`/`vaav1enc`) additionally need
 VAAPI-capable GPU/driver (`libva`, `/dev/dri/renderD*` node) at *runtime*
 to even register as available element factories — no such device,
@@ -84,26 +94,33 @@ as genuinely-uninstalled plugin, not build failure.
 
 Pipeline, one direction: `main.rs` (clap entry point, dispatch to iced
 GUI or headless encode) → `ui/` (setup/encoding pages, GUI path only) →
-`pipeline.rs` (`gst::Pipeline` built, driven via `gstreamer`/
-`gstreamer-app`/`gstreamer-video`, using `encoders.rs` for chosen output
-codec's element) → `dct_backend.rs`'s `ComputeBackend` (GPU or CPU) →
+`pipeline.rs` (thin dispatcher: resolves `ComputeBackend` → `Box<dyn
+DctBackend>` once, resolves `MediaBackendChoice` → `Box<dyn MediaBackend>`,
+calls its `run`) → `backends::gstreamer::GstreamerBackend` (only
+`MediaBackend` impl today — `gst::Pipeline` built, driven via `gstreamer`/
+`gstreamer-app`/`gstreamer-video`, mapping `Codec` to a GStreamer encoder
+element internally) → `dct_backend.rs`'s `ComputeBackend` (GPU or CPU) →
 `gpu.rs` (wgpu compute) / `cpu.rs` (plain Rust + rayon), both driven by
 same basis math `dct_math.rs` → (GPU only) `shader.wgsl`.
 
-- **`src/lib.rs`** re-exports `pub mod cpu; pub mod dct_backend; mod
-  dct_math; pub mod encoders; pub mod gpu; pub mod pipeline;` so both
-  `wavefold` binary (`main.rs`/`ui/`) and `tests/integration.rs` link
-  against same public API — split exists specifically so pipeline
-  exercised without GUI. `dct_math` deliberately *not* `pub` — `pub(crate)`
-  plumbing shared only between `gpu.rs` and `cpu.rs`, not part crate's
-  public surface. `ui/` and `main.rs` binary-only (not part library) since
-  not exercised by `tests/integration.rs`.
+- **`src/lib.rs`** re-exports `pub mod backends; pub mod codec; pub mod
+  cpu; pub mod dct_backend; mod dct_math; pub mod gpu; pub mod
+  media_backend; pub mod pipeline;` so both `wavefold` binary
+  (`main.rs`/`ui/`) and `tests/integration.rs` link against same public
+  API — split exists specifically so pipeline exercised without GUI.
+  `dct_math` deliberately *not* `pub` — `pub(crate)` plumbing shared only
+  between `gpu.rs` and `cpu.rs`, not part crate's public surface. `ui/` and
+  `main.rs` binary-only (not part library) since not exercised by
+  `tests/integration.rs`.
 
 - **`src/main.rs`** — single binary, one `clap::Parser` (`Cli { command:
   Option<Command> }`) with two subcommands: `Gui` (also default when no
   subcommand given, via `.unwrap_or(Command::Gui)` — preserves old "just
   run binary" muscle memory) and `Encode { input, output, cutoff,
-  encoder, backend }`. `run_gui()` same
+  encoder, backend, media_backend }` (`encoder: Codec`, `media_backend:
+  MediaBackendChoice` — CLI flag stays named `--encoder` for continuity
+  even though the type is now backend-agnostic `Codec`, not a GStreamer-
+  specific enum). `run_gui()` same
   `iced::application(ui::App::default, ui::App::update, ui::App::view).run()`
   bootstrap binary always had; `run_encode(...)` former `wavefold-cli`
   binary's body verbatim — spawns `pipeline::run` on `std::thread` exactly
@@ -122,15 +139,39 @@ same basis math `dct_math.rs` → (GPU only) `shader.wgsl`.
 - **`src/dct_backend.rs`** — `DctBackend` (trait `gpu.rs`'s `DctGpu` and
   `cpu.rs`'s `DctCpu` both implement: one `process_rgb(r, g, b, width,
   height, cutoff)` method) and `ComputeBackend` (user-facing `Gpu`/`Cpu`
-  choice — same enum+`ALL`+`Display`+resolver shape as `EncoderChoice` in
-  `encoders.rs`, same reason: one switchable choice GUI pick_list and
-  CLI's `--backend` flag both need). `ComputeBackend::
+  choice — same enum+`ALL`+`Display`+resolver shape as `Codec` in
+  `codec.rs` and `MediaBackendChoice` in `media_backend.rs`, same reason:
+  one switchable choice GUI pick_list and a CLI flag both need).
+  `ComputeBackend::
   build()` single
   place turns choice into live `Box<dyn DctBackend>` (`DctGpu::new()`, can
   fail no compatible adapter, vs `DctCpu::new()`, can't fail). Also
-  derives `clap::ValueEnum` (as does `EncoderChoice`) so CLI's
-  `--backend`/`--encoder` flags share one source of truth with GUI's
-  pick_lists instead of separate hand-maintained CLI-side enum.
+  derives `clap::ValueEnum` (as do `Codec`/`MediaBackendChoice`) so CLI's
+  `--backend`/`--encoder`/`--media-backend` flags share one source of
+  truth with GUI's pick_lists instead of separate hand-maintained
+  CLI-side enums.
+
+- **`src/codec.rs`** — `Codec` (8 variants: H264/H265/Vp9/Av1, each with a
+  `*Hardware` counterpart), `is_hardware()`, `ALL`/`Display`/
+  `clap::ValueEnum` (same shape as `ComputeBackend` above). Purely a
+  user-facing choice of codec+hw-or-not — knows nothing about GStreamer
+  or any other backend; `backends::gstreamer` is what maps a `Codec` onto
+  a concrete element. Renamed/moved from the old `encoders.rs`'s
+  `EncoderChoice` when the `MediaBackend` abstraction was introduced —
+  variant names changed (`H264Vaapi` → `H264Hardware` etc.) since "VAAPI"
+  is GStreamer/Linux-specific vocabulary a future non-GStreamer backend
+  wouldn't share.
+
+- **`src/media_backend.rs`** — `PipelineMsg` (moved here from
+  `pipeline.rs`, unchanged shape), `MediaBackend` trait (one `run(input,
+  output, cutoff, codec, dct: Box<dyn DctBackend>, tx)` method — decode
+  `input` to RGB frames, run `dct.process_rgb` over each, re-encode into
+  `codec`, audio passthrough, report via `tx`), and `MediaBackendChoice`
+  (`Gstreamer`/`MediaFoundation`, `cfg`-gated so exactly one is compiled
+  in per target, same `ALL`/`Display`/`clap::ValueEnum`/`build()` shape as
+  `ComputeBackend`/`Codec` — the extension point for adding a third
+  platform's backend later without touching `pipeline.rs`'s dispatcher or
+  any call site).
 
 - **`src/dct_math.rs`** — `dct_basis`/`transpose_square`, pure-CPU
   matrix-generation math shared verbatim by both `gpu.rs` (uploads result
@@ -154,11 +195,14 @@ same basis math `dct_math.rs` → (GPU only) `shader.wgsl`.
     dropped in dispatch match.
   - **`ui/setup.rs`** — input/output file pickers (`rfd::AsyncFileDialog`
     via `Task::perform`, not old synchronous `rfd::FileDialog`), cutoff
-    slider, encoder `pick_list` (`EncoderChoice` implements `Display` in
-    `encoders.rs` specifically for this), second `pick_list` for
+    slider, encoder `pick_list` (`Codec` implements `Display` in
+    `codec.rs` specifically for this), second `pick_list` for
     `ComputeBackend` (same `Display`-via-`label()` pattern, in
     `dct_backend.rs`), Encode button (`on_press_maybe`, only enabled once
-    both paths set).
+    both paths set). No `pick_list` for `MediaBackendChoice` — only one
+    variant exists, a picker with a single disabled option would be dead
+    UI; `ui/encoding.rs` passes `MediaBackendChoice::Gstreamer` straight
+    through instead.
   - **`ui/encoding.rs`** — `State::start(input, output, cutoff, encoder,
     backend)` spawns `pipeline::run` on plain `std::thread` (blocking
     call, not async — spawning as tokio task would tie up executor thread
@@ -171,9 +215,20 @@ same basis math `dct_math.rs` → (GPU only) `shader.wgsl`.
     reports done) returning `Action::
     BackToSetup`.
 
-- **`src/encoders.rs`** — `EncoderChoice` (8 variants: H264/H265/Vp9/Av1,
-  each with `*Vaapi` hardware counterpart) and its `profile()` →
-  `EncoderProfile { element_factory_name, properties, parser, hardware }`:
+- **`src/pipeline.rs`** — thin dispatcher, all that's left here after the
+  `MediaBackend` abstraction: `run(input, output, cutoff, codec,
+  compute_backend, media_backend, tx)` resolves `compute_backend` into a
+  `Box<dyn DctBackend>` once via `.build()?` (shared regardless of which
+  media backend runs — DCT compute choice is orthogonal to decode/encode
+  choice), sends the "initializing ... DCT backend" `PipelineMsg::Log`,
+  then calls `media_backend.build().run(...)` and turns an `Err` into
+  `PipelineMsg::Error` — the same outward behavior the old monolithic
+  `pipeline.rs` had, just split across the dispatcher and whichever
+  backend `media_backend` resolves to.
+
+- **`src/backends/gstreamer.rs`** — the only `MediaBackend` impl today;
+  builds and drives one `gst::Pipeline` per encode. `codec_profile(codec)`
+  → private `EncoderProfile { element_factory_name, properties, parser }`:
   GStreamer element factory name for `gst::ElementFactory::make` (not
   codec-ID lookup — several codecs have more than one GStreamer encoder
   element), that element's own properties (set via
@@ -182,7 +237,7 @@ same basis math `dct_math.rs` → (GPU only) `shader.wgsl`.
   parser element name. Different encoders take entirely different
   property sets — `tune=zerolatency` for x264/x265; `deadline`+
   `lag-in-frames` for vp9; `cpu-used`+`lag-in-frames` for av1; no
-  properties for VAAPI variants — not codec-ID swap.
+  properties for hardware variants — not codec-ID swap.
   - **Every software encoder needs internal lookahead/B-frame buffering
     disabled** (frame-in, frame-out), or can fail emit first output
     packet fast enough for muxer (a `GstAggregator`) complete preroll on
@@ -192,8 +247,8 @@ same basis math `dct_math.rs` → (GPU only) `shader.wgsl`.
     exact hang with `x264enc`'s defaults). Fix differs per encoder
     (`tune=zerolatency` for x264/x265; `lag-in-frames=0` for vp9/av1) so
     each set explicitly rather than assumed to share x264's property
-    names. VAAPI encoders don't need this: `b-frames` already defaults to
-    `0`.
+    names. Hardware (VAAPI) encoders don't need this: `b-frames` already
+    defaults to `0`.
   - **`parser: Option<&'static str>`** (`h264parse`/`h265parse`) is
     inserted between encoder and muxer's request pad — standard
     GStreamer practice, and *required* in practice for H.265: `x265enc`'s
@@ -206,25 +261,28 @@ same basis math `dct_math.rs` → (GPU only) `shader.wgsl`.
   - **No `vavp9enc` exists** in GStreamer's `va` plugin (confirmed against
     this machine's real AMD/Mesa VAAPI driver: only `vavp9dec` registers,
     no encoder) — same VP9-hw-encode gap this project already hit and
-    tolerated via previous ffmpeg-next VAAPI path. `Vp9Vaapi` stays
-    selectable (`ElementFactory::make` fails cleanly with `None` rather
-    than panicking) so tolerant hardware-failure skip in
+    tolerated via previous ffmpeg-next VAAPI path. `Codec::Vp9Hardware`
+    stays selectable (`ElementFactory::make` fails cleanly with `None`
+    rather than panicking) so tolerant hardware-failure skip in
     `tests/integration.rs` still exercises that path.
-  - **`hardware: bool`** is read only by `tests/integration.rs`'s
+  - **`Codec::is_hardware()`** is read only by `tests/integration.rs`'s
     tolerant-skip logic (hardware availability is environment/
-    driver-dependent) — `pipeline.rs` itself doesn't need to know.
+    driver-dependent) — `codec_profile` itself dispatches on the `Codec`
+    variant directly, doesn't need it.
 
-- **`src/pipeline.rs`** — builds and drives one `gst::Pipeline` per encode.
-  `run`/`run_inner` take a `backend: ComputeBackend` parameter (alongside
-  `encoder_choice`); `run_inner` resolves it once via `backend.build()?`
-  into a `Box<dyn DctBackend>` (the trait has `Send` as a supertrait
-  specifically so it can move into the `appsink` callback below, which
-  GStreamer invokes from its own streaming thread) before building the
-  pipeline. `PipelineMsg`'s shape (`Progress`/`Log`/`Done`/`Error` over a
-  `tokio::sync::mpsc::UnboundedSender`) is unchanged from earlier
-  ffmpeg-next implementation — whole point of this rewrite was to keep
-  that outward contract identical so `ui/`, `main.rs`, and
-  `tests/integration.rs` didn't have to change.
+  `GstreamerBackend::run` takes an already-resolved `dct: Box<dyn
+  DctBackend>` (alongside `codec`) — `pipeline.rs`'s dispatcher builds it
+  before calling in, this module never touches `ComputeBackend` at all.
+  `run_inner` wraps it in `Arc<Mutex<...>>` (the trait has `Send` as a
+  supertrait specifically so it can move into the `appsink` callback
+  below, which GStreamer invokes from its own streaming thread) before
+  building the pipeline. `PipelineMsg`'s shape (`Progress`/`Log`/`Done`/
+  `Error` over a `tokio::sync::mpsc::UnboundedSender`, now defined in
+  `media_backend.rs` rather than here) is unchanged from earlier
+  ffmpeg-next implementation — whole point of the original GStreamer
+  rewrite was to keep that outward contract identical so `ui/`,
+  `main.rs`, and `tests/integration.rs` didn't have to change; the later
+  `MediaBackend` split kept it unchanged again for the same reason.
   - **Pipeline shape**: `filesrc ! decodebin`, whose `autoplug-continue`
     signal is told to keep decoding video (`true`) but stop the moment
     audio caps are no longer already `audio/x-raw` (`false`) — this is
@@ -314,14 +372,14 @@ same basis math `dct_math.rs` → (GPU only) `shader.wgsl`.
     the old ffmpeg-next-based estimate.
   - **`qtmux`/`x265enc`+VAAPI-HEVC caveat**: `x265enc`'s raw output caps
     don't satisfy `qtmux`'s video pad template without a `h265parse`
-    element in between (see `encoders.rs` above) — and this AMD/Mesa
+    element in between (see `codec_profile` above) — and this AMD/Mesa
     VAAPI driver's `vah265enc` pads non-64-aligned frame dimensions to the
     next HEVC CTU boundary without writing a correct SPS conformance-window
     crop back, so a probe of the muxed output can report the *padded*
     dimensions instead of the real ones (confirmed directly with
     `gst-launch-1.0`) — a genuine driver limitation, not something
-    `pipeline.rs` can fix; `tests/integration.rs`'s shared multi-encoder
-    fixture stays 64-aligned specifically to sidestep it.
+    `backends/gstreamer.rs` can fix; `tests/integration.rs`'s shared
+    multi-encoder fixture stays 64-aligned specifically to sidestep it.
   - **`vp9enc` cannot mux into `qtmux`** in this GStreamer version: it
     never emits a `chroma-format` field in its output caps regardless of
     upstream pixel format, while `qtmux`'s `video/x-vp9` pad template
@@ -342,6 +400,65 @@ same basis math `dct_math.rs` → (GPU only) `shader.wgsl`.
     `tracing` on purpose: test binaries never call `tracing_subscriber::
     fmt::init()`, so a `tracing` call there would silently vanish instead
     of printing.
+
+- **`src/backends/media_foundation.rs`** — the only `MediaBackend` impl on
+  Windows (`cfg(windows)`), built on `IMFSourceReader`/`IMFSinkWriter`
+  instead of `gst::Pipeline`. Verified by cross-compiling the *whole*
+  crate (GUI included) for `x86_64-pc-windows-msvc` via `cargo xwin`
+  (confirms real linkage against `mfplat.dll`/`mfreadwrite.dll`/
+  `ole32.dll`, not just that it type-checks) and exercising the actual
+  decode/encode API calls under Wine's `winegstreamer`-backed MF
+  implementation — no real Windows machine was available to verify
+  end-to-end.
+  - **`codec_target(codec)`** → `{ subtype: GUID, hardware: bool }`:
+    `MFVideoFormat_H264`/`_HEVC`/`_VP90`/`_AV1` for the subtype,
+    `hardware` feeds `MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS` on the sink
+    writer (allow vs. force-software a hardware MFT — MF auto-picks
+    whichever registered encoder matches the subtype, there's no
+    GStreamer-style explicit element-name selection). Windows has no
+    built-in VP9 *encoder* MFT (only a decoder, via the "VP9 Video
+    Extensions") — same gap `backends::gstreamer` already has for
+    `vavp9enc`, kept selectable and left to fail cleanly at `AddStream`/
+    `SetInputMediaType` time.
+  - **`MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING` must be set on the
+    source reader's attributes** before requesting `MFVideoFormat_RGB32`
+    output — without it, `SetCurrentMediaType` fails with
+    `MF_E_INVALIDMEDIATYPE` (confirmed directly). This is what lets the
+    source reader insert whatever colorspace-convert MFT the native
+    format needs, mirroring why `backends::gstreamer` forces
+    `video/x-raw,format=RGB` through a `videoconvert` element.
+  - **`MFVideoFormat_RGB32` is BGRA, not RGB**, and can be a *bottom-up*
+    DIB (negative stride from `IMF2DBuffer::Lock2D`) — the classic
+    Windows bitmap convention this format inherits. `split_bgra_planes`
+    handles both the channel order and a negative stride's row-order
+    flip; `join_bgra_planes` always writes top-down (`stride ==
+    width*4`) since it's a fresh buffer this backend allocates itself,
+    with no inherited orientation to preserve.
+  - **`IMF2DBuffer::Lock2D` is used over plain `IMFMediaBuffer::Lock`**
+    when available — the correct, stride-aware way to read image data
+    (pitch can exceed `width*4` for padding), same reasoning as
+    `backends::gstreamer`'s `VideoFrameRef::plane_stride()`. Falls back to
+    treating the buffer as tightly packed for the rare buffer that
+    doesn't implement `IMF2DBuffer`.
+  - **Audio passthrough** (`setup_audio_passthrough`) adds the input's
+    native, still-encoded audio type straight to the sink writer (no
+    decode/re-encode) — the `IMFSourceReader`-equivalent of
+    `backends::gstreamer`'s `autoplug-continue`-based stream copy. The
+    main read loop uses `MF_SOURCE_READER_ANY_STREAM`, letting the
+    reader itself decide which stream's next sample is due, instead of
+    manually interleaving video/audio reads.
+  - **Container support is real Windows Media Foundation's own
+    limitation, not something this code can paper over**: MF reliably
+    ships byte-stream handlers for mp4/mov/asf, not Matroska — unlike
+    `backends::gstreamer`'s `matroskamux` fallback for non-mp4 outputs
+    (needed there specifically for VP9), a `.mkv` output on the MF
+    backend just fails with whatever error MF gives for an unresolvable
+    handler.
+  - **`CoInitializeEx`/`MFStartup` and their matching `CoUninitialize`/
+    `MFShutdown`** are RAII-guarded (`ComGuard`/`MfGuard`) so an early
+    `?` on any setup step still runs them on the way out — same
+    every-exit-path reasoning as `backends::gstreamer`'s
+    `pipeline.set_state(Null)`.
 
 - **`src/gpu.rs`** — `DctGpu`: the whole-frame (not block-based) separable
   2D DCT. Per plane, 4 GPU dispatches ping-pong two buffers: forward row →
@@ -372,13 +489,13 @@ same basis math `dct_math.rs` → (GPU only) `shader.wgsl`.
     `mask_params_buf` and the `b.cutoff != cutoff` branch in `encode_plane`
     are for.
   - `process_plane` (single-channel) is kept for the unit tests /
-    simple callers; `pipeline.rs` uses `process_rgb` for the actual encode
-    path.
+    simple callers; `backends/gstreamer.rs` uses `process_rgb` for the
+    actual encode path.
   - This is a **naive O(N) per-axis** transform (not a fast/FFT-based DCT),
     so cost scales roughly with `width·height·(width+height)` per plane per
-    frame — `pipeline.rs` logs a warning above 640×480 because this gets
-    slow fast at real video resolutions. Don't "simplify" this without
-    accounting for that cost.
+    frame — `backends/gstreamer.rs` logs a warning above 640×480 because
+    this gets slow fast at real video resolutions. Don't "simplify" this
+    without accounting for that cost.
 
 - **`src/cpu.rs`** — `DctCpu`: a direct transcription of `shader.wgsl`'s
   `row_pass`/`col_pass` into plain Rust, run on the CPU instead of the GPU —
@@ -388,7 +505,8 @@ same basis math `dct_math.rs` → (GPU only) `shader.wgsl`.
   <= threshold`). Exists purely so the effect can run with no GPU/wgpu
   adapter present — e.g. `.github/workflows/ci.yml`'s runner. Each pass
   parallelizes over independent output rows with `rayon::par_chunks_mut`
-  (same technique as `pipeline.rs`'s `split_rgb_planes`/`join_rgb_planes`),
+  (same technique as `backends/gstreamer.rs`'s `split_rgb_planes`/
+  `join_rgb_planes`),
   so it's GPU-less but not single-threaded. Caches the basis matrices in a
   `RefCell<Option<Basis>>` keyed on `(width, height)`, mirroring `DctGpu`'s
   `PlaneBuffers` cache shape minus the GPU-specific bind-group machinery.

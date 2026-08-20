@@ -1,5 +1,6 @@
+use wavefold::codec::Codec;
 use wavefold::dct_backend::ComputeBackend;
-use wavefold::encoders::EncoderChoice;
+use wavefold::media_backend::MediaBackendChoice;
 use wavefold::pipeline::{self, PipelineMsg};
 use iced::widget::{button, column, progress_bar, scrollable, text};
 use iced::{Element, Fill, Task};
@@ -29,11 +30,13 @@ impl State {
     /// Kicks off `pipeline::run` on a dedicated OS thread (it's a blocking
     /// call, not async) and returns a `Task` that streams its progress
     /// channel back reactively instead of the page polling every frame.
-    pub fn start(input: PathBuf, output: PathBuf, cutoff: f32, encoder: EncoderChoice, backend: ComputeBackend) -> (Self, Task<Message>) {
+    pub fn start(input: PathBuf, output: PathBuf, cutoff: f32, encoder: Codec, backend: ComputeBackend) -> (Self, Task<Message>) {
         let state = Self { progress_current: 0, progress_total: 0, log: Vec::new(), running: true };
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        std::thread::spawn(move || pipeline::run(&input, &output, cutoff, encoder, backend, tx));
+        // No picker for this yet - only one media backend exists (see
+        // MediaBackendChoice's doc comment).
+        std::thread::spawn(move || pipeline::run(&input, &output, cutoff, encoder, backend, MediaBackendChoice::ALL[0], tx));
 
         let task = Task::run(UnboundedReceiverStream::new(rx), Message::Pipeline).chain(Task::done(Message::WorkerDone));
         (state, task)

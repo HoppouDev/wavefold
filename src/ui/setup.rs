@@ -1,5 +1,5 @@
+use wavefold::codec::Codec;
 use wavefold::dct_backend::ComputeBackend;
-use wavefold::encoders::EncoderChoice;
 use iced::widget::{button, column, pick_list, row, slider, text};
 use iced::{Element, Task};
 use std::path::PathBuf;
@@ -8,13 +8,13 @@ pub struct State {
     input: Option<PathBuf>,
     output: Option<PathBuf>,
     cutoff: f32,
-    encoder: EncoderChoice,
+    encoder: Codec,
     backend: ComputeBackend,
 }
 
 impl Default for State {
     fn default() -> Self {
-        Self { input: None, output: None, cutoff: 0.6, encoder: EncoderChoice::H264, backend: ComputeBackend::Gpu }
+        Self { input: None, output: None, cutoff: 0.6, encoder: Codec::H264, backend: ComputeBackend::Gpu }
     }
 }
 
@@ -25,7 +25,7 @@ pub enum Message {
     PickOutput,
     OutputPicked(Option<PathBuf>),
     CutoffChanged(f32),
-    EncoderSelected(EncoderChoice),
+    EncoderSelected(Codec),
     BackendSelected(ComputeBackend),
     Start,
 }
@@ -37,7 +37,7 @@ pub enum Message {
 pub enum Action {
     None,
     Run(Task<Message>),
-    Start { input: PathBuf, output: PathBuf, cutoff: f32, encoder: EncoderChoice, backend: ComputeBackend },
+    Start { input: PathBuf, output: PathBuf, cutoff: f32, encoder: Codec, backend: ComputeBackend },
 }
 
 impl State {
@@ -100,7 +100,7 @@ impl State {
 
         let encoder_row = row![
             text("Encoder:"),
-            pick_list(EncoderChoice::ALL, Some(self.encoder), Message::EncoderSelected),
+            pick_list(Codec::ALL, Some(self.encoder), Message::EncoderSelected),
         ]
         .spacing(10);
 

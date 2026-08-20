@@ -11,15 +11,27 @@ bytemuck = { version = "1.16", features = ["derive"] }
 pollster = "1"
 anyhow = "1"
 rfd = "0.17"
-gstreamer = "0.25"
-gstreamer-app = "0.25"
-gstreamer-video = "0.25"
 rayon = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 tokio = { version = "1", features = ["sync"] }
 tokio-stream = "0.1"
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Media I/O backend: GStreamer everywhere except Windows (no system package
+# manager there to provide it - see backends/media_foundation.rs), Media
+# Foundation (part of the OS, no extra runtime needed) on Windows.
+[target.'cfg(not(windows))'.dependencies]
+gstreamer = "0.25"
+gstreamer-app = "0.25"
+gstreamer-video = "0.25"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+  "Win32_Media_MediaFoundation",
+  "Win32_Foundation",
+  "Win32_System_Com",
+] }
 
 [build-dependencies]
 embed-resource = "3"

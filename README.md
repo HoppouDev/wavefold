@@ -5,7 +5,14 @@ decodes, runs a per-frame DCT reconstruct pass (GPU via wgpu, or
 a CPU fallback), and re-encodes with a chosen codec (x264/x265/vp9/av1,
 software or VAAPI hardware).
 
-## Supported output codecs
+## Media backend
+
+Decode/encode is behind a `MediaBackend` trait, one implementation per
+platform: **GStreamer** everywhere except Windows (no system package
+manager there to install it from), **Media Foundation** on Windows (part
+of the OS, no separate runtime needed).
+
+### Supported output codecs (GStreamer backend — Linux/macOS)
 
 | Codec       | Software element | VAAPI hardware element | Notes                                                              |
 |-------------|-------------------|-------------------------|---------------------------------------------------------------------|
@@ -13,6 +20,25 @@ software or VAAPI hardware).
 | H.265/HEVC  | `x265enc`         | `vah265enc`             |                                                                     |
 | VP9         | `vp9enc`          | — (not available)       | No GPU has VAAPI VP9 encode. Software VP9 must mux to `.mkv`, not `.mp4`. |
 | AV1         | `av1enc`          | `vaav1enc`               |                                                                     |
+
+### Supported output codecs (Media Foundation backend — Windows)
+
+Media Foundation auto-negotiates whichever encoder MFT is registered for
+the requested codec — there's no fixed element name the way GStreamer has.
+`--encoder <codec>-hardware` sets `MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS`
+to allow (not force) a hardware MFT; the plain variant forces software.
+
+| Codec       | Notes                                                              |
+|-------------|---------------------------------------------------------------------|
+| H.264       |                                                                     |
+| H.265/HEVC  |                                                                     |
+| VP9         | Windows ships an MF *decoder* for VP9, not an encoder — same gap as the GStreamer backend's missing VAAPI VP9 encode. |
+| AV1         | Encoder availability depends on what's registered on the system (varies by Windows version/hardware). |
+
+Output container is inferred from the file extension by Media Foundation's
+own byte-stream-handler resolution — reliably `.mp4`/`.mov`; unlike the
+GStreamer backend there's no built-in non-MP4 fallback, so a `.mkv` output
+fails cleanly instead of muxing.
 
 ## Build
 
@@ -112,23 +138,18 @@ the older separate `gst-vaapi` package was removed upstream.
 
 ### Windows
 
-Not container-tested (no practical way to containerize a GUI/GPU build
-here) — based on GStreamer's own documented Windows setup, not verified
-end-to-end like the Linux distros above:
+Uses the Media Foundation backend (see above) — Media Foundation ships
+with Windows itself, so unlike Linux there's no separate media framework
+to install:
 
 1. Install Rust via [rustup-init](https://rustup.rs), MSVC toolchain
    (`stable-x86_64-pc-windows-msvc`).
-2. Install both the **runtime** and **development** MSVC GStreamer
-   installers from [gstreamer.freedesktop.org](https://gstreamer.freedesktop.org/download/#windows)
-   (64-bit, "Complete" install — the development one specifically for
-   headers/`.lib`s/pkg-config files).
-3. Add GStreamer's `bin` directory to `PATH` and set
-   `PKG_CONFIG_PATH` to its `lib\pkgconfig` directory (the installer
-   sets `GSTREAMER_1_0_ROOT_MSVC_X86_64`, which both derive from).
-4. `cargo build --release`.
+2. `cargo build --release`.
 
-VAAPI is Linux-only; on Windows only the software encoders (x264/x265/vp9/av1)
-are available.
+Cross-compilation to `x86_64-pc-windows-msvc` (via `cargo xwin`, which
+provides the Windows SDK/CRT import libraries) was used to verify this
+builds and links correctly during development; a real Windows machine was
+not available to verify the built exe runs end-to-end.
 
 ### Linux desktop shortcut
 
