@@ -20,12 +20,12 @@ use std::path::PathBuf;
 #[command(name = "wavefold", about = "Apply a whole-frame DCT distortion effect to video — GUI or headless")]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Launch the desktop GUI (also the default when no subcommand is given)
+    /// Launch the desktop GUI
     Gui,
     /// Run a headless encode, no display server required
     Encode {
@@ -61,7 +61,7 @@ fn main() {
     }
 
     tracing_subscriber::fmt::init();
-    match Cli::parse().command.unwrap_or(Command::Gui) {
+    match Cli::parse().command {
         Command::Gui => {
             if let Err(e) = run_gui() {
                 eprintln!("GUI error: {e}");
