@@ -491,11 +491,28 @@ same basis math `dct_math.rs` → (GPU only) `shader.wgsl`.
   - `process_plane` (single-channel) is kept for the unit tests /
     simple callers; `backends/gstreamer.rs` uses `process_rgb` for the
     actual encode path.
-  - This is a **naive O(N) per-axis** transform (not a fast/FFT-based DCT),
-    so cost scales roughly with `width·height·(width+height)` per plane per
-    frame — `backends/gstreamer.rs` logs a warning above 640×480 because
-    this gets slow fast at real video resolutions. Don't "simplify" this
-    without accounting for that cost.
+  - This is an **O(N) per-axis** transform (not a fast/FFT-based DCT), so
+    FLOP count scales roughly with `width·height·(width+height)` per plane
+    per frame regardless of the tiling below — `backends/gstreamer.rs` logs
+    a warning above 640×480 because this gets slow fast at real video
+    resolutions. Don't "simplify" this without accounting for that cost.
+  - `encode_plane`'s dispatch groups are sized off a `TILE` constant
+    (currently 16, mirroring `shader.wgsl`'s own `TILE`) rather than a bare
+    workgroup size — the two must stay in lockstep, since the shader now
+    tiles its memory access pattern through `workgroup` storage (see
+    `shader.wgsl` below); a mismatch wouldn't fail to compile, just produce
+    wrong output.
+  - `DctGpu::poll_bounded` bounds `device.poll` to `GPU_POLL_TIMEOUT` (30s)
+    instead of `wgpu::PollType::wait_indefinitely()` — confirmed
+    reproducing a silent hang (GPU *and* CPU both idle, no error) at
+    1920×1082 on `wait_indefinitely()`: a too-slow dispatch pushed past the
+    driver's TDR window, Windows reset the GPU out from under the process,
+    and the unbounded wait then blocked forever on a fence that would never
+    signal. A bounded wait turns that into a reported error instead of a
+    silent freeze. The tiled shader below dropped a 1920×1082 `process_rgb`
+    call to ~340ms (confirmed), well under both the TDR window and this
+    timeout, but the timeout stays as a safety net for resolutions large
+    enough to still cross it.
 
 - **`src/cpu.rs`** — `DctCpu`: a direct transcription of `shader.wgsl`'s
   `row_pass`/`col_pass` into plain Rust, run on the CPU instead of the GPU —
@@ -516,12 +533,35 @@ same basis math `dct_math.rs` → (GPU only) `shader.wgsl`.
   unconditionally, with no adapter guard, since that's the whole point.
 
 - **`src/shader.wgsl`** — the two WGSL compute entry points (`row_pass`,
-  `col_pass`) that back the passes above. No shared/workgroup memory is
-  used (each thread does its full O(width) or O(height) sum independently),
-  which is what makes the whole-frame approach possible at all — an actual
-  8×8-block-style design with workgroup-shared memory can't scale to
-  arbitrary frame dimensions (workgroup size / shared memory limits), which
-  is why this isn't block-based like a real video codec.
+  `col_pass`) that back the passes above. Each pass is a dense matrix
+  multiply (`row_pass`: `SRC * B^T`, K = width; `col_pass`: `B * SRC`, K =
+  height) tiled through `workgroup`-shared memory — the standard blocked-
+  GEMM technique: walk the K dimension in `TILE`-sized (16) chunks, cache
+  both operand tiles in shared storage per chunk so every value pulled
+  from `storage` is reused `TILE` times instead of once, `workgroupBarrier()`
+  between the load and the accumulate. This is unrelated to (and not
+  limited by) any fixed block size in the DCT itself — the frame stays
+  whole-frame, only the *memory access pattern* is tiled, walking however
+  many `TILE`-sized chunks `width`/`height` need — so it scales to
+  arbitrary frame dimensions same as the untiled version did; the earlier
+  claim here that shared memory can't scale past a fixed block size
+  conflated 8×8-block-style *codec* design with GEMM tiling, which are
+  unrelated. `TILE=16` gives 256 invocations/workgroup (the portable
+  `max_compute_invocations_per_workgroup` limit, confirmed via
+  `wgpu::Limits::default()`/`downlevel_defaults()`) and 2KB of shared
+  storage, both far under the portable 16KB `max_compute_workgroup_
+  storage_size` floor.
+  - Because `workgroupBarrier()` requires every invocation in the
+    workgroup to reach it, out-of-range threads (frame dimensions not a
+    multiple of `TILE`) can't early-return before the tile loop the way
+    the untiled version could bounds-check up front — they stay in
+    lockstep through every barrier with zero-padded loads, and only skip
+    the final `dst` write.
+  - Confirmed via `cpu_and_gpu_backends_agree` (unaffected — same math,
+    `src/cpu.rs` never touches this file) and the existing GPU test suite,
+    including the `width==1`/`height==1` edge case
+    (`handles_one_pixel_wide_and_tall_frames`) where `num_tiles` still
+    computes to 1 despite being far smaller than `TILE`.
 
 ## Communication style (AGENTS.md / Cursor / Copilot / Windsurf / Cline rules)
 

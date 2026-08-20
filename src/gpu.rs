@@ -6,14 +6,15 @@ use std::cell::RefCell;
 use std::time::Duration;
 use tracing::debug;
 
-/// Bound on a single `device.poll` wait. Large frames on the naive
-/// whole-frame shader (see `DctGpu` docs) can push one dispatch past the
-/// driver's TDR window, at which point the GPU is reset out from under
-/// this process; `wgpu::PollType::wait_indefinitely()` then blocks forever
-/// on a fence that will never signal, with both GPU and CPU sitting fully
-/// idle - confirmed reproducing this exact silent hang at 1920x1082
-/// (well past the 640x480 size this backend already warns about). A
-/// bounded wait turns that into a clean, reported error instead.
+/// Bound on a single `device.poll` wait. Large enough frames (see
+/// `DctGpu` docs) can still push one dispatch past the driver's TDR
+/// window despite `shader.wgsl`'s tiling, at which point the GPU is reset
+/// out from under this process; `wgpu::PollType::wait_indefinitely()`
+/// then blocks forever on a fence that will never signal, with both GPU
+/// and CPU sitting fully idle - confirmed reproducing this exact silent
+/// hang at 1920x1082 (well past the 640x480 size this backend already
+/// warns about) before the tiling rewrite. A bounded wait turns that into
+/// a clean, reported error instead.
 const GPU_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 use wgpu::util::DeviceExt;
 
@@ -315,8 +316,10 @@ impl DctGpu {
                 label: Some("dct pass"),
                 timestamp_writes: None,
             });
-            let groups_x = (width + 7) / 8;
-            let groups_y = (height + 7) / 8;
+            // Must match shader.wgsl's `TILE`/`@workgroup_size`.
+            const TILE: u32 = 16;
+            let groups_x = width.div_ceil(TILE);
+            let groups_y = height.div_ceil(TILE);
 
             // forward row transform: input -> a
             pass.set_pipeline(&self.row_pipeline);
@@ -351,7 +354,7 @@ impl DctGpu {
     /// Blocks until the most recent submission completes, or `GPU_POLL_TIMEOUT`
     /// elapses - whichever comes first. A bounded wait instead of
     /// `wait_indefinitely()` so a driver-level GPU reset (Windows TDR, most
-    /// likely at resolutions well beyond the naive-shader warning threshold)
+    /// likely at resolutions well beyond the 640x480 warning threshold)
     /// surfaces as a clear error instead of hanging this thread forever.
     fn poll_bounded(&self) -> Result<()> {
         match self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(GPU_POLL_TIMEOUT) }) {
