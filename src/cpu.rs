@@ -234,7 +234,7 @@ mod tests {
 
     #[test]
     fn cpu_and_gpu_backends_agree() {
-        let Ok(gpu) = DctGpu::new() else {
+        let Ok(gpu) = DctGpu::new(crate::dct_backend::DctAlgorithm::Matmul) else {
             eprintln!("skipping GPU cross-check: no adapter available");
             return;
         };

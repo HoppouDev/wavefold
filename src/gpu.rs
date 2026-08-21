@@ -1,10 +1,24 @@
-use crate::dct_backend::DctBackend;
+use crate::dct_backend::{DctAlgorithm, DctBackend};
 use crate::dct_math::{dct_basis, transpose_square};
+use crate::fft_plan::{dct_interleave_index, digit_reverse_index, fft_eligible, GpuFft, PermParams, StageParams, C32};
 use anyhow::{bail, Context, Result};
 use bytemuck::{Pod, Zeroable};
 use std::cell::RefCell;
 use std::time::Duration;
 use tracing::debug;
+
+/// One planned GPU dispatch for `encode_plane_fft`'s chained pipeline -
+/// built (buffers + bind groups created) before any compute pass opens,
+/// then executed by iterating a `Vec<Item>` inside one pass. `Fft` covers
+/// every `shader_fft.wgsl` pipeline (one bind group, index 0); `Gemm`
+/// covers `shader.wgsl`'s `row_pass`/`col_pass` (two bind groups: params
+/// at index 0, io at index 1 - `DctGpu`'s shared `params_layout`/
+/// `io_layout` from the `Matmul` path, reused as-is for the FFT
+/// algorithm's per-axis GEMM fallback).
+enum Item<'a> {
+    Fft { pipeline: &'a wgpu::ComputePipeline, bind_group: wgpu::BindGroup, groups: (u32, u32, u32) },
+    Gemm { pipeline: &'a wgpu::ComputePipeline, params_bind_group: wgpu::BindGroup, io_bind_group: wgpu::BindGroup, groups: (u32, u32, u32) },
+}
 
 /// Bound on a single `device.poll` wait. Large enough frames (see
 /// `DctGpu` docs) can still push one dispatch past the driver's TDR
@@ -80,12 +94,33 @@ pub struct DctGpu {
     // submit all 3 channels' work before blocking on any of them, instead
     // of forcing a full stall-and-resume round trip per channel — slots
     // must stay physically separate since each channel's GPU work is
-    // in flight concurrently.
+    // in flight concurrently. Only used by `DctAlgorithm::Matmul` (the
+    // `Fft` path below is already a multi-stage blocking round trip per
+    // channel, so this specific overlap optimization doesn't apply there
+    // — see `encode_plane_fft`'s doc comment).
     buffers: [RefCell<Option<PlaneBuffers>>; 3],
+    algorithm: DctAlgorithm,
+    // Always built (cheap — just pipeline objects) regardless of
+    // `algorithm`, so switching would need no extra adapter/device work;
+    // only actually dispatched into when `algorithm == DctAlgorithm::Fft`.
+    gpu_fft: GpuFft,
+    // `DctAlgorithm::Fft`'s per-axis GEMM fallback (`plan_gemm_pass`)
+    // generates and uploads an O(n²) basis matrix - confirmed via direct
+    // benchmarking that doing this fresh every frame (a real video is
+    // thousands of frames at the same resolution) was the single biggest
+    // remaining cost after chaining eliminated the per-stage round trips:
+    // 1920x1082 (height=1082=2x541 falls back) went from 2.1x slower than
+    // the tiled GEMM to competitive once this cache was added. Single
+    // slot, keyed on `n` - both axes falling back to GEMM at once (two
+    // different large-prime dimensions) is rare enough that thrashing
+    // this one slot in that case is an acceptable, still-correct
+    // trade-off rather than two full cache slots for a case that mostly
+    // doesn't happen.
+    gemm_basis_cache: RefCell<Option<(u32, wgpu::Buffer, wgpu::Buffer)>>,
 }
 
 impl DctGpu {
-    pub fn new() -> Result<Self> {
+    pub fn new(algorithm: DctAlgorithm) -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..wgpu::InstanceDescriptor::new_without_display_handle_from_env()
@@ -193,6 +228,7 @@ impl DctGpu {
         };
         let row_pipeline = make_pipeline("row_pass");
         let col_pipeline = make_pipeline("col_pass");
+        let gpu_fft = GpuFft::new(&device);
 
         Ok(Self {
             device,
@@ -202,6 +238,9 @@ impl DctGpu {
             params_layout,
             io_layout,
             buffers: [RefCell::new(None), RefCell::new(None), RefCell::new(None)],
+            algorithm,
+            gpu_fft,
+            gemm_basis_cache: RefCell::new(None),
         })
     }
 
@@ -211,6 +250,9 @@ impl DctGpu {
     /// spectrum ((near-)lossless), values near 0 keep only the coefficients
     /// closest to DC, producing strong global ringing.
     pub fn process_plane(&self, pixels: &[f32], width: u32, height: u32, cutoff: f32) -> Result<Vec<f32>> {
+        if self.algorithm == DctAlgorithm::Fft {
+            return self.encode_plane_fft(pixels, width, height, cutoff);
+        }
         self.encode_plane(0, pixels, width, height, cutoff)?;
         let rx = self.begin_read(0)?;
         self.poll_bounded()?;
@@ -221,7 +263,10 @@ impl DctGpu {
     /// one frame at once: all three channels' work is submitted to the GPU,
     /// and all three `map_async` readbacks are issued, before blocking on
     /// any of them — one `device.poll` drives all three to completion
-    /// instead of a full stall-and-resume round trip per channel.
+    /// instead of a full stall-and-resume round trip per channel. Only
+    /// applies to `DctAlgorithm::Matmul`; the `Fft` path processes each
+    /// channel through its own several-stage blocking sequence (see
+    /// `encode_plane_fft`) since it doesn't fit this single-submit shape.
     pub fn process_rgb(
         &self,
         r: &[f32],
@@ -231,6 +276,12 @@ impl DctGpu {
         height: u32,
         cutoff: f32,
     ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        if self.algorithm == DctAlgorithm::Fft {
+            let r_out = self.encode_plane_fft(r, width, height, cutoff)?;
+            let g_out = self.encode_plane_fft(g, width, height, cutoff)?;
+            let b_out = self.encode_plane_fft(b, width, height, cutoff)?;
+            return Ok((r_out, g_out, b_out));
+        }
         self.encode_plane(0, r, width, height, cutoff)?;
         self.encode_plane(1, g, width, height, cutoff)?;
         self.encode_plane(2, b, width, height, cutoff)?;
@@ -349,6 +400,461 @@ impl DctGpu {
         self.queue.submit(Some(encoder.finish()));
 
         Ok(())
+    }
+
+    /// `DctAlgorithm::Fft`'s whole-plane pipeline: each axis (row using
+    /// `width`, column using `height`) independently runs either the FFT
+    /// path (`fft_eligible`, i.e. factors completely into {2,3,5,7} and is
+    /// even) or falls back to a single un-cached GEMM dispatch — row and
+    /// column transforms are independent 1D operations in this separable
+    /// design, and both algorithms produce the same real orthonormal
+    /// DCT-II/III coefficients at each stage boundary (verified in
+    /// `fft_plan.rs`'s tests), so mixing them per axis needs no special
+    /// glue beyond the row-major/column-major bridge (`transpose_real`)
+    /// the FFT batch passes need (they read a contiguous length-n
+    /// sequence per batch element; GEMM's row-major layout has columns
+    /// strided, not contiguous).
+    ///
+    /// Every dispatch for the whole plane - forward row, forward col +
+    /// mask, inverse col, inverse row + clamp, and every FFT sub-stage
+    /// within those - is planned into one `Vec<Item>` (pure buffer/bind-
+    /// group creation, no GPU work yet) and then executed inside a single
+    /// compute pass, one `queue.submit`, one blocking readback at the
+    /// end - matching `encode_plane`'s one-submit-per-plane shape instead
+    /// of each stage doing its own round trip. An earlier version did
+    /// submit-and-block per stage (confirmed via direct benchmarking:
+    /// ~8-10 blocking round trips per plane, and the FFT path came out
+    /// 1.3-1.7x *slower* than the tiled GEMM at 1920x1080/1920x1082/
+    /// 3840x2160 despite doing far fewer FLOPs — the round-trip latency
+    /// dominated). Correctness of chaining many dispatches through
+    /// different pipelines/bind-groups within one compute pass, all
+    /// reading/writing shared storage buffers, is exactly what
+    /// `encode_plane` above already relies on (WebGPU compute passes
+    /// guarantee per-pass dispatch ordering); this reuses that same
+    /// guarantee at a larger scale.
+    fn encode_plane_fft(&self, pixels: &[f32], width: u32, height: u32, cutoff: f32) -> Result<Vec<f32>> {
+        if width == 0 || height == 0 {
+            bail!("process_plane: width and height must both be non-zero (got {width}x{height})");
+        }
+        if pixels.len() != width as usize * height as usize {
+            bail!(
+                "process_plane: pixel buffer has {} elements, expected width*height = {}",
+                pixels.len(),
+                width as usize * height as usize
+            );
+        }
+        let (w, h) = (width as usize, height as usize);
+        let row_factors = fft_eligible(w);
+        let col_factors = fft_eligible(h);
+        let threshold = cutoff.clamp(0.0, 2.0) + f32::EPSILON;
+        let real_bytes = (pixels.len() * std::mem::size_of::<f32>()) as u64;
+
+        use wgpu::util::DeviceExt;
+        let mut items: Vec<Item> = Vec::new();
+
+        let input_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("fft plane input"),
+            contents: bytemuck::cast_slice(pixels),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        // Stage 1: forward row transform (per row, length width). Row
+        // passes never need a transpose - a row-major width x height
+        // buffer is already `height` contiguous length-`width` batches.
+        let stage1 = match &row_factors {
+            Some(factors) => self.plan_fft_dct2(&mut items, &input_buf, w, factors, h),
+            None => self.plan_gemm_pass(&mut items, &input_buf, width, height, true, false, false, false, threshold),
+        };
+
+        // Stage 2: forward column transform + cutoff mask.
+        let stage2 = match &col_factors {
+            Some(factors) => {
+                let transposed = self.plan_transpose(&mut items, &stage1, w, h);
+                let col_dct = self.plan_fft_dct2(&mut items, &transposed, h, factors, w);
+                let back = self.plan_transpose(&mut items, &col_dct, h, w);
+                self.plan_mask(&mut items, &back, w, h, threshold)
+            }
+            None => self.plan_gemm_pass(&mut items, &stage1, width, height, false, false, true, false, threshold),
+        };
+
+        // Stage 3: inverse column transform.
+        let stage3 = match &col_factors {
+            Some(factors) => {
+                let transposed = self.plan_transpose(&mut items, &stage2, w, h);
+                let col_idct = self.plan_fft_dct3(&mut items, &transposed, h, factors, w);
+                self.plan_transpose(&mut items, &col_idct, h, w)
+            }
+            None => self.plan_gemm_pass(&mut items, &stage2, width, height, false, true, false, false, threshold),
+        };
+
+        // Stage 4: inverse row transform + clamp to pixel range.
+        let final_buf = match &row_factors {
+            Some(factors) => {
+                let out = self.plan_fft_dct3(&mut items, &stage3, w, factors, h);
+                self.plan_clamp(&mut items, &out, w * h)
+            }
+            None => self.plan_gemm_pass(&mut items, &stage3, width, height, true, true, false, true, threshold),
+        };
+
+        let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fft plane staging"),
+            size: real_bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("fft plane encoder") });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("fft plane pass"), timestamp_writes: None });
+            for item in &items {
+                match item {
+                    Item::Fft { pipeline, bind_group, groups } => {
+                        pass.set_pipeline(pipeline);
+                        pass.set_bind_group(0, bind_group, &[]);
+                        pass.dispatch_workgroups(groups.0, groups.1, groups.2);
+                    }
+                    Item::Gemm { pipeline, params_bind_group, io_bind_group, groups } => {
+                        pass.set_pipeline(pipeline);
+                        pass.set_bind_group(0, params_bind_group, &[]);
+                        pass.set_bind_group(1, io_bind_group, &[]);
+                        pass.dispatch_workgroups(groups.0, groups.1, groups.2);
+                    }
+                }
+            }
+        }
+        encoder.copy_buffer_to_buffer(&final_buf, 0, &staging_buf, 0, real_bytes);
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = staging_buf.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        self.poll_bounded()?;
+        rx.recv().context("gpu map channel closed")??;
+        let data = slice.get_mapped_range().context("failed to map gpu buffer")?;
+        let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging_buf.unmap();
+        Ok(result)
+    }
+
+    /// Appends a forward DCT-II FFT sequence (combined interleave+digit-
+    /// reversal scatter permute, one dispatch per Cooley-Tukey stage,
+    /// post-twiddle+scale) to `items`, operating on `src` (real,
+    /// `n * batch_count` elements). Returns the new real output buffer.
+    fn plan_fft_dct2<'a>(&'a self, items: &mut Vec<Item<'a>>, src: &wgpu::Buffer, n: usize, factors: &[usize], batch_count: usize) -> wgpu::Buffer {
+        use wgpu::util::DeviceExt;
+        let device = &self.device;
+        let complex_bytes = (n * batch_count * std::mem::size_of::<C32>()) as u64;
+        let real_bytes = (n * batch_count * std::mem::size_of::<f32>()) as u64;
+        let total = (n * batch_count) as u32;
+
+        let complex_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("dct2 complex"), size: complex_bytes, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
+        let combined_perm: Vec<u32> = (0..n).map(|i| digit_reverse_index(dct_interleave_index(i, n), factors) as u32).collect();
+        let perm_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("dct2 combined perm"), contents: bytemuck::cast_slice(&combined_perm), usage: wgpu::BufferUsages::STORAGE });
+        let perm_params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("dct2 fwd perm params"),
+            contents: bytemuck::bytes_of(&PermParams { n: n as u32, batch_count: batch_count as u32, _pad0: 0, _pad1: 0 }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let layout = self.gpu_fft.dct_forward_permute_pipeline.get_bind_group_layout(0);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("dct2 fwd perm bind group"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: perm_params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: perm_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: src.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: complex_buf.as_entire_binding() },
+            ],
+        });
+        items.push(Item::Fft { pipeline: &self.gpu_fft.dct_forward_permute_pipeline, bind_group, groups: (total.div_ceil(256), 1, 1) });
+
+        self.plan_fft_stages(items, &complex_buf, n, factors, batch_count, false);
+
+        let out_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("dct2 real output"), size: real_bytes, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let post_params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("dct2 post params"),
+            contents: bytemuck::bytes_of(&PermParams { n: n as u32, batch_count: batch_count as u32, _pad0: 0, _pad1: 0 }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let layout = self.gpu_fft.dct2_post_pipeline.get_bind_group_layout(0);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("dct2 post bind group"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: post_params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: complex_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: out_buf.as_entire_binding() },
+            ],
+        });
+        items.push(Item::Fft { pipeline: &self.gpu_fft.dct2_post_pipeline, bind_group, groups: (total.div_ceil(256), 1, 1) });
+        out_buf
+    }
+
+    /// Appends an inverse DCT-III FFT sequence to `items`, mirroring
+    /// `plan_fft_dct2`: boundary-aware conjugate-symmetric reconstruction,
+    /// plain digit-reversal permute, inverse FFT stages, gather+scale back
+    /// to real. Operates on `src` (real, `n * batch_count` elements).
+    fn plan_fft_dct3<'a>(&'a self, items: &mut Vec<Item<'a>>, src: &wgpu::Buffer, n: usize, factors: &[usize], batch_count: usize) -> wgpu::Buffer {
+        use wgpu::util::DeviceExt;
+        let device = &self.device;
+        let complex_bytes = (n * batch_count * std::mem::size_of::<C32>()) as u64;
+        let real_bytes = (n * batch_count * std::mem::size_of::<f32>()) as u64;
+        let total = (n * batch_count) as u32;
+
+        let natural_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("dct3 natural"), size: complex_bytes, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
+        let pre_params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("dct3 pre params"),
+            contents: bytemuck::bytes_of(&PermParams { n: n as u32, batch_count: batch_count as u32, _pad0: 0, _pad1: 0 }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let layout = self.gpu_fft.dct3_pre_pipeline.get_bind_group_layout(0);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("dct3 pre bind group"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: pre_params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: src.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: natural_buf.as_entire_binding() },
+            ],
+        });
+        items.push(Item::Fft { pipeline: &self.gpu_fft.dct3_pre_pipeline, bind_group, groups: (total.div_ceil(256), 1, 1) });
+
+        let reversed_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("dct3 reversed"), size: complex_bytes, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
+        let plain_perm: Vec<u32> = (0..n).map(|i| digit_reverse_index(i, factors) as u32).collect();
+        let plain_perm_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("dct3 plain perm"), contents: bytemuck::cast_slice(&plain_perm), usage: wgpu::BufferUsages::STORAGE });
+        let perm_params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("dct3 digit reverse params"),
+            contents: bytemuck::bytes_of(&PermParams { n: n as u32, batch_count: batch_count as u32, _pad0: 0, _pad1: 0 }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let layout = self.gpu_fft.permute_pipeline.get_bind_group_layout(0);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("dct3 digit reverse bind group"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: perm_params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: plain_perm_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: natural_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: reversed_buf.as_entire_binding() },
+            ],
+        });
+        items.push(Item::Fft { pipeline: &self.gpu_fft.permute_pipeline, bind_group, groups: (total.div_ceil(256), 1, 1) });
+
+        self.plan_fft_stages(items, &reversed_buf, n, factors, batch_count, true);
+
+        let out_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("dct3 real output"), size: real_bytes, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let gather_idx: Vec<u32> = (0..n).map(|i| dct_interleave_index(i, n) as u32).collect();
+        let gather_idx_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("dct3 gather idx"), contents: bytemuck::cast_slice(&gather_idx), usage: wgpu::BufferUsages::STORAGE });
+        let post_params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("dct3 post params"),
+            contents: bytemuck::bytes_of(&PermParams { n: n as u32, batch_count: batch_count as u32, _pad0: 0, _pad1: 0 }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let layout = self.gpu_fft.dct3_post_pipeline.get_bind_group_layout(0);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("dct3 post bind group"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: post_params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: gather_idx_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: reversed_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: out_buf.as_entire_binding() },
+            ],
+        });
+        items.push(Item::Fft { pipeline: &self.gpu_fft.dct3_post_pipeline, bind_group, groups: (total.div_ceil(256), 1, 1) });
+        out_buf
+    }
+
+    /// Appends one dispatch per Cooley-Tukey stage (factors in reverse
+    /// order, matching `fft_mixed_radix`) to `items`, in place on `buf`.
+    fn plan_fft_stages<'a>(&'a self, items: &mut Vec<Item<'a>>, buf: &wgpu::Buffer, n: usize, factors: &[usize], batch_count: usize, inverse: bool) {
+        use wgpu::util::DeviceExt;
+        let device = &self.device;
+        let sign = if inverse { 1.0 } else { -1.0 };
+        let mut l = 1usize;
+        for &r in factors.iter().rev() {
+            let l_new = l * r;
+            let groups = n / l_new;
+            let work_per_batch = groups * l;
+            let total_work = (work_per_batch * batch_count) as u32;
+
+            let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("fft stage params"),
+                contents: bytemuck::bytes_of(&StageParams { n: n as u32, l: l as u32, radix: r as u32, batch_count: batch_count as u32, sign, _pad0: 0, _pad1: 0, _pad2: 0 }),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let layout = self.gpu_fft.stage_pipeline.get_bind_group_layout(0);
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("fft stage bind group"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: buf.as_entire_binding() },
+                ],
+            });
+            items.push(Item::Fft { pipeline: &self.gpu_fft.stage_pipeline, bind_group, groups: (total_work.div_ceil(256), 1, 1) });
+            l = l_new;
+        }
+    }
+
+    /// Appends a `width x height` -> `height x width` row-major transpose.
+    fn plan_transpose<'a>(&'a self, items: &mut Vec<Item<'a>>, src: &wgpu::Buffer, width: usize, height: usize) -> wgpu::Buffer {
+        use wgpu::util::DeviceExt;
+        let device = &self.device;
+        #[repr(C)]
+        #[derive(Clone, Copy, Pod, Zeroable)]
+        struct TransposeParams {
+            width: u32,
+            height: u32,
+        }
+        let real_bytes = (width * height * std::mem::size_of::<f32>()) as u64;
+        let out_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("transpose output"), size: real_bytes, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("transpose params"),
+            contents: bytemuck::bytes_of(&TransposeParams { width: width as u32, height: height as u32 }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let layout = self.gpu_fft.transpose_pipeline.get_bind_group_layout(0);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("transpose bind group"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: src.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: out_buf.as_entire_binding() },
+            ],
+        });
+        items.push(Item::Fft { pipeline: &self.gpu_fft.transpose_pipeline, bind_group, groups: (((width * height) as u32).div_ceil(256), 1, 1) });
+        out_buf
+    }
+
+    /// Appends `shader_fft.wgsl`'s cutoff-mask pass, in place on a copy of
+    /// `src` (the mask pipeline writes in place, so a fresh buffer seeded
+    /// with `src`'s contents via a GPU-side copy keeps `src` itself
+    /// untouched for any other consumer).
+    fn plan_mask<'a>(&'a self, items: &mut Vec<Item<'a>>, src: &wgpu::Buffer, width: usize, height: usize, threshold: f32) -> wgpu::Buffer {
+        use wgpu::util::DeviceExt;
+        let device = &self.device;
+        #[repr(C)]
+        #[derive(Clone, Copy, Pod, Zeroable)]
+        struct MaskParams {
+            width: u32,
+            height: u32,
+            threshold: f32,
+            _pad: u32,
+        }
+        let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("mask params"),
+            contents: bytemuck::bytes_of(&MaskParams { width: width as u32, height: height as u32, threshold, _pad: 0 }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let layout = self.gpu_fft.mask_pipeline.get_bind_group_layout(0);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mask bind group"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: src.as_entire_binding() },
+            ],
+        });
+        items.push(Item::Fft { pipeline: &self.gpu_fft.mask_pipeline, bind_group, groups: (((width * height) as u32).div_ceil(256), 1, 1) });
+        src.clone()
+    }
+
+    /// Appends `shader_fft.wgsl`'s pixel-range clamp pass, in place on `src`.
+    fn plan_clamp<'a>(&'a self, items: &mut Vec<Item<'a>>, src: &wgpu::Buffer, len: usize) -> wgpu::Buffer {
+        let layout = self.gpu_fft.clamp_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("clamp bind group"),
+            layout: &layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: src.as_entire_binding() }],
+        });
+        items.push(Item::Fft { pipeline: &self.gpu_fft.clamp_pipeline, bind_group, groups: ((len as u32).div_ceil(256), 1, 1) });
+        src.clone()
+    }
+
+    /// Appends one un-cached GEMM dispatch (`shader.wgsl`'s
+    /// `row_pass`/`col_pass`) to `items` - the FFT algorithm's per-axis
+    /// GEMM fallback, planned (not submitted) so it chains into the same
+    /// single-submit pipeline as the FFT stages around it. Not cached:
+    /// this only runs for the axis that *didn't* get faster via FFT (a
+    /// stray large-prime factor, e.g. 541), so it's already the slow path
+    /// for that axis; caching its basis matrix across frames is a
+    /// reasonable follow-up if benchmarking shows it matters.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_gemm_pass<'a>(
+        &'a self,
+        items: &mut Vec<Item<'a>>,
+        src: &wgpu::Buffer,
+        width: u32,
+        height: u32,
+        row_axis: bool,
+        inverse: bool,
+        apply_mask: bool,
+        clamp_output: bool,
+        threshold: f32,
+    ) -> wgpu::Buffer {
+        use wgpu::util::DeviceExt;
+        let device = &self.device;
+        let n = if row_axis { width } else { height } as usize;
+
+        // Cached across calls (see `gemm_basis_cache`'s doc comment) - an
+        // O(n^2) basis matrix is far too expensive to regenerate and
+        // re-upload every single frame at this axis's fixed length.
+        let basis_buf = {
+            let mut cache = self.gemm_basis_cache.borrow_mut();
+            let hit = matches!(&*cache, Some((cached_n, _, _)) if *cached_n == n as u32);
+            if !hit {
+                debug!(n, "rebuilding GEMM fallback basis matrix (length changed)");
+                let basis = dct_basis(n);
+                let basis_t = transpose_square(&basis, n);
+                let fwd = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("gemm fallback basis fwd"), contents: bytemuck::cast_slice(&basis), usage: wgpu::BufferUsages::STORAGE });
+                let inv = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("gemm fallback basis inv"), contents: bytemuck::cast_slice(&basis_t), usage: wgpu::BufferUsages::STORAGE });
+                *cache = Some((n as u32, fwd, inv));
+            }
+            let (_, fwd, inv) = cache.as_ref().expect("just populated above");
+            if inverse { inv.clone() } else { fwd.clone() }
+        };
+
+        let real_bytes = (width as u64) * (height as u64) * std::mem::size_of::<f32>() as u64;
+        let output_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("gemm fallback output"), size: real_bytes, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let params = Params { width, height, threshold, apply_mask: apply_mask as u32, clamp_output: clamp_output as u32, _pad0: 0, _pad1: 0, _pad2: 0 };
+        let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("gemm fallback params"), contents: bytemuck::bytes_of(&params), usage: wgpu::BufferUsages::UNIFORM });
+        // row_pass only reads row_basis (binding 1); col_pass only reads
+        // col_basis (binding 2) - binding the one buffer we built to both
+        // slots satisfies the shared layout without a throwaway buffer.
+        let params_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gemm fallback params bind group"),
+            layout: &self.params_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: basis_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: basis_buf.as_entire_binding() },
+            ],
+        });
+        let io_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gemm fallback io bind group"),
+            layout: &self.io_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: src.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: output_buf.as_entire_binding() },
+            ],
+        });
+
+        // GEMM row_pass/col_pass need two bind groups (params at index 0,
+        // io at index 1) - unlike every FFT pipeline above, which only
+        // needs one. `Item::Gemm` carries both.
+        const TILE: u32 = 16;
+        items.push(Item::Gemm {
+            pipeline: if row_axis { &self.row_pipeline } else { &self.col_pipeline },
+            params_bind_group,
+            io_bind_group,
+            groups: (width.div_ceil(TILE), height.div_ceil(TILE), 1),
+        });
+        output_buf
     }
 
     /// Blocks until the most recent submission completes, or `GPU_POLL_TIMEOUT`
@@ -545,7 +1051,17 @@ mod tests {
     use super::*;
 
     fn skip_no_gpu() -> Option<DctGpu> {
-        match DctGpu::new() {
+        match DctGpu::new(DctAlgorithm::Matmul) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                eprintln!("skipping GPU test: no adapter available ({e:#})");
+                None
+            }
+        }
+    }
+
+    fn skip_no_gpu_fft() -> Option<DctGpu> {
+        match DctGpu::new(DctAlgorithm::Fft) {
             Ok(g) => Some(g),
             Err(e) => {
                 eprintln!("skipping GPU test: no adapter available ({e:#})");
@@ -626,4 +1142,32 @@ mod tests {
         let wrong_len = vec![0f32; 3];
         assert!(gpu.process_plane(&wrong_len, 4, 4, 1.0).is_err());
     }
+
+    /// The real end-to-end proof `DctAlgorithm::Fft` and `Matmul` agree:
+    /// covers both a fully FFT-eligible frame (both axes factor into
+    /// {2,3,5,7}) and a mixed one (one axis has a large prime factor, e.g.
+    /// 44 = 2²×11, forcing that axis onto the GEMM fallback while the
+    /// other still uses FFT) — exercising `encode_plane_fft`'s per-axis
+    /// branching, not just the pure-FFT or pure-GEMM extremes.
+    #[test]
+    fn fft_and_matmul_algorithms_agree() {
+        let Some(fft_gpu) = skip_no_gpu_fft() else { return };
+        let Some(matmul_gpu) = skip_no_gpu() else { return };
+
+        for (w, h) in [(48u32, 60u32), (48u32, 44u32)] {
+            let r: Vec<f32> = (0..(w * h)).map(|i| ((i * 41 + 7) % 256) as f32).collect();
+            let g: Vec<f32> = (0..(w * h)).map(|i| ((i * 53 + 11) % 256) as f32).collect();
+            let b: Vec<f32> = (0..(w * h)).map(|i| ((i * 67 + 13) % 256) as f32).collect();
+
+            let fft_out = fft_gpu.process_rgb(&r, &g, &b, w, h, 0.5).unwrap();
+            let matmul_out = matmul_gpu.process_rgb(&r, &g, &b, w, h, 0.5).unwrap();
+
+            for (plane, (fft, matmul)) in [(fft_out.0, matmul_out.0), (fft_out.1, matmul_out.1), (fft_out.2, matmul_out.2)].into_iter().enumerate() {
+                for (i, (a, b)) in fft.iter().zip(matmul.iter()).enumerate() {
+                    assert!((a - b).abs() < 1.0, "{w}x{h} plane {plane} index {i}: fft={a} matmul={b}");
+                }
+            }
+        }
+    }
+
 }

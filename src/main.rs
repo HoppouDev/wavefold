@@ -10,7 +10,7 @@ mod ui;
 
 use clap::{Parser, Subcommand};
 use wavefold::codec::Codec;
-use wavefold::dct_backend::ComputeBackend;
+use wavefold::dct_backend::{ComputeBackend, DctAlgorithm};
 use wavefold::media_backend::MediaBackendChoice;
 use wavefold::pipeline::{self, PipelineMsg};
 use std::io::Write;
@@ -42,6 +42,10 @@ enum Command {
         /// DCT compute backend. `cpu` needs no GPU at all (e.g. for CI runners).
         #[arg(long, value_enum, default_value_t = ComputeBackend::Gpu)]
         backend: ComputeBackend,
+        /// DCT algorithm (GPU backend only): the O(N log N) FFT-based path,
+        /// or the original O(N^2) matrix-multiply.
+        #[arg(long, value_enum, default_value_t = DctAlgorithm::Fft)]
+        dct_algorithm: DctAlgorithm,
         /// Decode/encode implementation. Only one exists today; this is the
         /// selector for when another is added.
         #[arg(long, value_enum, default_value_t = MediaBackendChoice::ALL[0])]
@@ -68,8 +72,8 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Encode { input, output, cutoff, encoder, backend, media_backend } => {
-            run_encode(input, output, cutoff, encoder, backend, media_backend);
+        Command::Encode { input, output, cutoff, encoder, backend, dct_algorithm, media_backend } => {
+            run_encode(input, output, cutoff, encoder, backend, dct_algorithm, media_backend);
         }
     }
 }
@@ -94,9 +98,9 @@ fn load_icon() -> iced::window::Icon {
         .expect("embedded app icon has valid dimensions")
 }
 
-fn run_encode(input: PathBuf, output: PathBuf, cutoff: f32, encoder: Codec, backend: ComputeBackend, media_backend: MediaBackendChoice) {
+fn run_encode(input: PathBuf, output: PathBuf, cutoff: f32, encoder: Codec, backend: ComputeBackend, dct_algorithm: DctAlgorithm, media_backend: MediaBackendChoice) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let handle = std::thread::spawn(move || pipeline::run(&input, &output, cutoff, encoder, backend, media_backend, tx));
+    let handle = std::thread::spawn(move || pipeline::run(&input, &output, cutoff, encoder, backend, dct_algorithm, media_backend, tx));
 
     let mut had_error = false;
     while let Some(msg) = rx.blocking_recv() {

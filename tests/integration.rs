@@ -77,7 +77,7 @@ fn encodes_synthetic_clip_end_to_end() {
         eprintln!("skipping: ffmpeg not available");
         return;
     }
-    if wavefold::gpu::DctGpu::new().is_err() {
+    if wavefold::gpu::DctGpu::new(wavefold::dct_backend::DctAlgorithm::Fft).is_err() {
         eprintln!("skipping: no GPU adapter available");
         return;
     }
@@ -96,7 +96,7 @@ fn encodes_synthetic_clip_end_to_end() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let input2 = input.clone();
     let output2 = output.clone();
-    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, wavefold::codec::Codec::H264, ComputeBackend::Gpu, wavefold::media_backend::MediaBackendChoice::ALL[0], tx));
+    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, wavefold::codec::Codec::H264, ComputeBackend::Gpu, wavefold::dct_backend::DctAlgorithm::Fft, wavefold::media_backend::MediaBackendChoice::ALL[0], tx));
 
     let mut saw_done = false;
     let mut saw_error = None;
@@ -144,7 +144,7 @@ fn encodes_synthetic_clip_with_cpu_backend() {
     let input2 = input.clone();
     let output2 = output.clone();
     let handle = std::thread::spawn(move || {
-        pipeline::run(&input2, &output2, 0.4, wavefold::codec::Codec::H264, ComputeBackend::Cpu, wavefold::media_backend::MediaBackendChoice::ALL[0], tx)
+        pipeline::run(&input2, &output2, 0.4, wavefold::codec::Codec::H264, ComputeBackend::Cpu, wavefold::dct_backend::DctAlgorithm::Fft, wavefold::media_backend::MediaBackendChoice::ALL[0], tx)
     });
 
     let mut saw_done = false;
@@ -183,7 +183,7 @@ fn reports_error_for_nonexistent_input() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let out2 = output.clone();
     let handle = std::thread::spawn(move || {
-        pipeline::run(std::path::Path::new("/nonexistent/wavefold_missing_input.mp4"), &out2, 0.32, wavefold::codec::Codec::H264, ComputeBackend::Gpu, wavefold::media_backend::MediaBackendChoice::ALL[0], tx)
+        pipeline::run(std::path::Path::new("/nonexistent/wavefold_missing_input.mp4"), &out2, 0.32, wavefold::codec::Codec::H264, ComputeBackend::Gpu, wavefold::dct_backend::DctAlgorithm::Fft, wavefold::media_backend::MediaBackendChoice::ALL[0], tx)
     });
 
     let mut saw_error = false;
@@ -203,7 +203,7 @@ fn encodes_synthetic_clip_with_audio_end_to_end() {
         eprintln!("skipping: ffmpeg not available");
         return;
     }
-    if wavefold::gpu::DctGpu::new().is_err() {
+    if wavefold::gpu::DctGpu::new(wavefold::dct_backend::DctAlgorithm::Fft).is_err() {
         eprintln!("skipping: no GPU adapter available");
         return;
     }
@@ -224,7 +224,7 @@ fn encodes_synthetic_clip_with_audio_end_to_end() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let input2 = input.clone();
     let output2 = output.clone();
-    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, wavefold::codec::Codec::H264, ComputeBackend::Gpu, wavefold::media_backend::MediaBackendChoice::ALL[0], tx));
+    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, wavefold::codec::Codec::H264, ComputeBackend::Gpu, wavefold::dct_backend::DctAlgorithm::Fft, wavefold::media_backend::MediaBackendChoice::ALL[0], tx));
 
     let mut saw_done = false;
     let mut saw_error = None;
@@ -262,7 +262,7 @@ fn encodes_with_every_selectable_encoder() {
         eprintln!("skipping: ffmpeg not available");
         return;
     }
-    if wavefold::gpu::DctGpu::new().is_err() {
+    if wavefold::gpu::DctGpu::new(wavefold::dct_backend::DctAlgorithm::Fft).is_err() {
         eprintln!("skipping: no GPU adapter available");
         return;
     }
@@ -286,7 +286,7 @@ fn encodes_with_every_selectable_encoder() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let input2 = input.clone();
         let output2 = output.clone();
-        let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.5, choice, ComputeBackend::Gpu, wavefold::media_backend::MediaBackendChoice::ALL[0], tx));
+        let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.5, choice, ComputeBackend::Gpu, wavefold::dct_backend::DctAlgorithm::Fft, wavefold::media_backend::MediaBackendChoice::ALL[0], tx));
 
         let mut saw_done = false;
         let mut saw_error = None;
@@ -359,7 +359,7 @@ fn encodes_clip_with_unspecified_channel_layout_audio() {
         eprintln!("skipping: ffmpeg not available");
         return;
     }
-    if wavefold::gpu::DctGpu::new().is_err() {
+    if wavefold::gpu::DctGpu::new(wavefold::dct_backend::DctAlgorithm::Fft).is_err() {
         eprintln!("skipping: no GPU adapter available");
         return;
     }
@@ -401,7 +401,7 @@ fn encodes_clip_with_unspecified_channel_layout_audio() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let input2 = input.clone();
     let output2 = output.clone();
-    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, wavefold::codec::Codec::H264, ComputeBackend::Gpu, wavefold::media_backend::MediaBackendChoice::ALL[0], tx));
+    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, wavefold::codec::Codec::H264, ComputeBackend::Gpu, wavefold::dct_backend::DctAlgorithm::Fft, wavefold::media_backend::MediaBackendChoice::ALL[0], tx));
 
     let mut saw_done = false;
     let mut saw_error = None;
@@ -444,7 +444,7 @@ fn estimates_total_frames_from_format_duration_when_stream_metadata_missing() {
         eprintln!("skipping: ffmpeg not available");
         return;
     }
-    if wavefold::gpu::DctGpu::new().is_err() {
+    if wavefold::gpu::DctGpu::new(wavefold::dct_backend::DctAlgorithm::Fft).is_err() {
         eprintln!("skipping: no GPU adapter available");
         return;
     }
@@ -484,7 +484,7 @@ fn estimates_total_frames_from_format_duration_when_stream_metadata_missing() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let input2 = input.clone();
     let output2 = output.clone();
-    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, wavefold::codec::Codec::H264, ComputeBackend::Gpu, wavefold::media_backend::MediaBackendChoice::ALL[0], tx));
+    let handle = std::thread::spawn(move || pipeline::run(&input2, &output2, 0.4, wavefold::codec::Codec::H264, ComputeBackend::Gpu, wavefold::dct_backend::DctAlgorithm::Fft, wavefold::media_backend::MediaBackendChoice::ALL[0], tx));
 
     let mut saw_done = false;
     let mut saw_error = None;
