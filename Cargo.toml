@@ -46,4 +46,3 @@ rustfft = "6"
 opt-level = 3
 lto = true
 strip = true
-codegen-units = 1
