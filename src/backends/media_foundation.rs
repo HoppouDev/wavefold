@@ -125,23 +125,24 @@ impl Drop for MfGuard {
     }
 }
 
-/// Deinterleaves a packed BGRA32 frame into three f32 planes (dropping
-/// alpha - Media Foundation's `MFVideoFormat_RGB32` is always opaque for
-/// this use case), honoring `stride` (from `IMF2DBuffer::Lock2D`, which
-/// can exceed `width*4` for padding, and can be *negative* for a
-/// bottom-up DIB - the classic Windows bitmap convention `MFVideoFormat_
-/// RGB32` inherits). Rows are independent, same rayon-over-rows treatment
-/// as `backends::gstreamer`'s `split_rgb_planes`.
+/// Deinterleaves a packed, already-top-down BGRA32 frame into three f32
+/// planes (dropping alpha - Media Foundation's `MFVideoFormat_RGB32` is
+/// always opaque for this use case). `stride` (from `IMF2DBuffer::Lock2D`)
+/// can exceed `width*4` for row padding, but is always positive by the
+/// time it reaches here - `read_sample_bgra` normalizes the bottom-up-DIB
+/// case (negative pitch) into a top-down buffer itself, since only that
+/// function has the raw pointer + signed pitch needed to walk rows
+/// correctly (see its doc comment). Rows are independent, same
+/// rayon-over-rows treatment as `backends::gstreamer`'s `split_rgb_planes`.
 fn split_bgra_planes(data: &[u8], width: u32, height: u32, stride: i32) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let (w, h) = (width as usize, height as usize);
-    let row_bytes = stride.unsigned_abs() as usize;
+    debug_assert!(stride >= 0, "split_bgra_planes expects an already-normalized top-down buffer");
+    let row_bytes = stride as usize;
     let mut r = vec![0f32; w * h];
     let mut g = vec![0f32; w * h];
     let mut b = vec![0f32; w * h];
     r.par_chunks_mut(w).zip(g.par_chunks_mut(w)).zip(b.par_chunks_mut(w)).enumerate().for_each(|(y, ((r_row, g_row), b_row))| {
-        // Negative stride: row 0 of the image is the *last* row in `data`.
-        let src_y = if stride < 0 { h - 1 - y } else { y };
-        let row = &data[src_y * row_bytes..src_y * row_bytes + w * 4];
+        let row = &data[y * row_bytes..y * row_bytes + w * 4];
         for x in 0..w {
             b_row[x] = row[x * 4] as f32;
             g_row[x] = row[x * 4 + 1] as f32;
@@ -171,22 +172,46 @@ fn join_bgra_planes(width: u32, height: u32, r: &[f32], g: &[f32], b: &[f32]) ->
     out
 }
 
-/// Reads one `IMFSample`'s single buffer out as bytes + stride, via
-/// `IMF2DBuffer::Lock2D` when the buffer supports it (the correct,
-/// stride-aware way to read image data - falls back to
-/// `IMFMediaBuffer::Lock`, treating it as tightly packed, for the rare
-/// buffer that doesn't implement `IMF2DBuffer`).
-unsafe fn read_sample_bgra(sample: &IMFSample, width: u32) -> Result<(Vec<u8>, i32)> {
+/// Reads one `IMFSample`'s single buffer out as an already-top-down,
+/// positive-stride byte buffer, via `IMF2DBuffer::Lock2D` when the buffer
+/// supports it - falls back to `IMFMediaBuffer::Lock`, treating it as
+/// tightly packed, for the rare buffer that doesn't implement
+/// `IMF2DBuffer`.
+///
+/// Confirmed directly against Microsoft's own `Lock2D` documentation:
+/// `scanline0` always points to the image's *top* row regardless of pitch
+/// sign, and row `y`'s address is `scanline0 + y*pitch` using *signed*
+/// pointer arithmetic - for a bottom-up DIB (negative pitch), row 1 sits
+/// *behind* `scanline0` in memory, not ahead of it. The previous version
+/// read `row_bytes * height` bytes forward from `scanline0` unconditionally
+/// (wrong memory for negative pitch - not merely flipped, genuinely the
+/// wrong bytes) and then applied a manual row-order flip in
+/// `split_bgra_planes` on top of that already-wrong read, which is why
+/// output came out upside down (and worse, was reading unrelated memory)
+/// specifically on frames Media Foundation delivers bottom-up. Walking
+/// each row via `scanline0.offset(y as isize * pitch as isize)` handles
+/// both signs correctly and needs no downstream flip at all.
+///
+/// Also takes `height` directly (known by the caller from the negotiated
+/// video type) rather than deriving it from `IMFMediaBuffer::
+/// GetCurrentLength` - Microsoft's docs for `Lock2D` explicitly note that
+/// `GetCurrentLength`/`GetMaxLength` "do not apply to the buffer that is
+/// returned by the Lock2D method", so trusting it for the row count was
+/// never guaranteed to be reliable.
+unsafe fn read_sample_bgra(sample: &IMFSample, width: u32, height: u32) -> Result<(Vec<u8>, i32)> {
     let buffer = sample.ConvertToContiguousBuffer().context("failed to get contiguous sample buffer")?;
     if let Ok(buffer_2d) = buffer.cast::<IMF2DBuffer>() {
         let mut scanline0: *mut u8 = std::ptr::null_mut();
         let mut pitch: i32 = 0;
         buffer_2d.Lock2D(&mut scanline0, &mut pitch).context("IMF2DBuffer::Lock2D failed")?;
         let row_bytes = pitch.unsigned_abs() as usize;
-        let height = buffer.GetCurrentLength().context("failed to get buffer length")? / (row_bytes as u32);
-        let data = std::slice::from_raw_parts(scanline0, row_bytes * height as usize).to_vec();
+        let mut data = vec![0u8; row_bytes * height as usize];
+        for y in 0..height as usize {
+            let src_row = scanline0.offset(y as isize * pitch as isize);
+            std::ptr::copy_nonoverlapping(src_row, data[y * row_bytes..(y + 1) * row_bytes].as_mut_ptr(), row_bytes);
+        }
         let _ = buffer_2d.Unlock2D();
-        Ok((data, pitch))
+        Ok((data, row_bytes as i32))
     } else {
         let mut data_ptr: *mut u8 = std::ptr::null_mut();
         let mut cur_len: u32 = 0;
@@ -377,7 +402,7 @@ fn encode(
             continue;
         }
 
-        let (bgra, stride) = unsafe { read_sample_bgra(&sample, width) }?;
+        let (bgra, stride) = unsafe { read_sample_bgra(&sample, width, height) }?;
         let (r, g, b) = split_bgra_planes(&bgra, width, height, stride);
         let (r2, g2, b2) = dct.process_rgb(&r, &g, &b, width, height, cutoff)?;
         let out_bytes = join_bgra_planes(width, height, &r2, &g2, &b2);
