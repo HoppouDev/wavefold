@@ -369,66 +369,212 @@ fn encode(
 
     unsafe { writer.BeginWriting() }.context("failed to start writing output")?;
 
-    let mut frame_idx = 0u64;
-    let mut pts_100ns = 0i64;
     let frame_duration_100ns = (10_000_000.0 / fps).round() as i64;
 
-    loop {
-        let mut flags = 0u32;
-        let mut stream_idx = 0u32;
-        let mut sample: Option<IMFSample> = None;
-        unsafe {
-            reader.ReadSample(
-                MF_SOURCE_READER_ANY_STREAM.0 as u32,
-                0,
-                Some(&mut stream_idx),
-                Some(&mut flags),
-                None,
-                Some(&mut sample),
-            )
-        }
-        .context("failed to read a sample")?;
+    // Decode / GPU DCT / encode run on three threads connected by bounded
+    // channels, instead of one serial read->process->write loop - the
+    // naive single-threaded version left the GPU idle while Media
+    // Foundation blocked on `ReadSample`/`WriteSample` and vice versa
+    // (confirmed: GPU utilization capped around 35%, no CPU core
+    // saturated, despite the encode already being fast in wall-clock
+    // terms). `backends::gstreamer` gets this overlap for free from its
+    // pipeline's own `queue` elements; Media Foundation's reader/writer
+    // API has no equivalent, so it has to be built by hand here.
+    //
+    // `reader`/`writer`/`IMFSample` are COM interfaces living in the
+    // process's MTA (see `ComGuard` / `COINIT_MULTITHREADED` above) - MTA
+    // objects have no thread affinity, only apartment affinity, so moving
+    // one to a different OS thread is sound as long as that thread has
+    // also joined the MTA before touching it (each worker below does its
+    // own `CoInitializeEx`/`ComGuard` pair for exactly that reason).
+    // Buffer by a fixed byte budget per channel rather than a fixed frame
+    // count - a fixed frame count let buffered memory scale with
+    // resolution unbounded (4 full-res f32 RGB frames at 3840x2160 is
+    // ~380MB per channel), so pick a frame count that keeps each channel
+    // within roughly `CHANNEL_BUDGET_BYTES`, clamped to stay >=2 (needed
+    // for any decode/compute/encode overlap at all) and capped at the old
+    // depth of 4 (no reason to buffer deeper than that just because a
+    // frame happens to be tiny).
+    const CHANNEL_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+    let frame_bytes = (width as usize) * (height as usize) * 3 * std::mem::size_of::<f32>();
+    let channel_depth = (CHANNEL_BUDGET_BYTES / frame_bytes.max(1)).clamp(2, 4);
 
-        if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 && stream_idx == video_stream_index {
-            break;
-        }
-        let Some(sample) = sample else { continue };
+    /// Marker restricting `MtaSend`'s unsafe `Send` impl to the specific
+    /// Media Foundation COM interfaces this module actually moves across
+    /// threads, instead of blanket-asserting `Send` for any `T` - a type
+    /// that isn't one of these (e.g. something genuinely not thread-safe
+    /// reused here by a future refactor) fails to compile instead of
+    /// silently getting an incorrect `Send` guarantee.
+    trait MfComSend {}
+    impl MfComSend for IMFSourceReader {}
+    impl MfComSend for IMFSinkWriter {}
+    impl MfComSend for IMFSample {}
 
-        if Some(stream_idx) == audio_stream_index {
-            unsafe { writer.WriteSample(1, &sample) }.context("failed to write passthrough audio sample")?;
-            continue;
-        }
-        if stream_idx != video_stream_index {
-            continue;
-        }
+    /// `windows-rs` COM interface wrappers are not `Send` by default (they
+    /// leave thread-affinity judgment to the caller) - this asserts what
+    /// the doc comment above already argues: an MTA object has no thread
+    /// affinity, so moving one across threads is sound as long as the
+    /// receiving thread has also joined the MTA (see the `ComGuard` pairs
+    /// in the decode/encode closures below) before touching it.
+    struct MtaSend<T: MfComSend>(T);
+    unsafe impl<T: MfComSend> Send for MtaSend<T> {}
 
-        let (bgra, stride) = unsafe { read_sample_bgra(&sample, width, height) }?;
-        let (r, g, b) = split_bgra_planes(&bgra, width, height, stride);
-        let (r2, g2, b2) = dct.process_rgb(&r, &g, &b, width, height, cutoff)?;
-        let out_bytes = join_bgra_planes(width, height, &r2, &g2, &b2);
-
-        let out_sample = unsafe {
-            let buffer = MFCreateMemoryBuffer(out_bytes.len() as u32).context("failed to allocate output buffer")?;
-            let mut dest: *mut u8 = std::ptr::null_mut();
-            buffer.Lock(&mut dest, None, None).context("failed to lock output buffer")?;
-            std::ptr::copy_nonoverlapping(out_bytes.as_ptr(), dest, out_bytes.len());
-            buffer.Unlock().context("failed to unlock output buffer")?;
-            buffer.SetCurrentLength(out_bytes.len() as u32).context("failed to set output buffer length")?;
-
-            let out_sample = MFCreateSample().context("failed to create output sample")?;
-            out_sample.AddBuffer(&buffer).context("failed to attach output buffer")?;
-            out_sample.SetSampleTime(pts_100ns).context("failed to set sample time")?;
-            out_sample.SetSampleDuration(frame_duration_100ns).context("failed to set sample duration")?;
-            out_sample
-        };
-        unsafe { writer.WriteSample(stream_index, &out_sample) }.context("failed to write encoded sample")?;
-        pts_100ns += frame_duration_100ns;
-
-        frame_idx += 1;
-        let _ = tx.send(PipelineMsg::Progress { current: frame_idx, total: total_frames });
+    // Audio and video both flow through this single decode->compute
+    // channel, in the order `ReadSample` produced them, so the compute
+    // thread forwards each message to `enc_tx` strictly in that same
+    // order (processing video through the GPU, passing audio straight
+    // through) - preserving the original single-threaded loop's
+    // audio/video write interleave instead of letting audio (which needs
+    // no GPU work) race ahead of video sitting in the compute queue.
+    enum DecodeMsg {
+        Audio(MtaSend<IMFSample>),
+        Video { r: Vec<f32>, g: Vec<f32>, b: Vec<f32> },
     }
 
-    unsafe { writer.Finalize() }.context("failed to finalize output")?;
+    enum EncodeMsg {
+        Audio(MtaSend<IMFSample>),
+        Video { r: Vec<f32>, g: Vec<f32>, b: Vec<f32> },
+    }
+
+    let (dec_tx, dec_rx) = std::sync::mpsc::sync_channel::<DecodeMsg>(channel_depth);
+    let (enc_tx, enc_rx) = std::sync::mpsc::sync_channel::<EncodeMsg>(channel_depth);
+
+    let decode_reader = MtaSend(reader);
+    let decode_handle = std::thread::Builder::new()
+        .name("wavefold-mf-decode".into())
+        .spawn(move || -> Result<()> {
+            unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok().context("decode thread: failed to join MTA")?;
+            let _com_guard = ComGuard;
+            // Forces capture of the whole `MtaSend` wrapper rather than
+            // disjoint-capturing just its `.0` field directly (which would
+            // bypass the wrapper's `unsafe impl Send` entirely - RFC 2229
+            // precise capture only sees the sub-path actually used).
+            let decode_reader = decode_reader;
+            let reader = decode_reader.0;
+
+            loop {
+                let mut flags = 0u32;
+                let mut stream_idx = 0u32;
+                let mut sample: Option<IMFSample> = None;
+                unsafe {
+                    reader.ReadSample(
+                        MF_SOURCE_READER_ANY_STREAM.0 as u32,
+                        0,
+                        Some(&mut stream_idx),
+                        Some(&mut flags),
+                        None,
+                        Some(&mut sample),
+                    )
+                }
+                .context("failed to read a sample")?;
+
+                if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 && stream_idx == video_stream_index {
+                    break;
+                }
+                let Some(sample) = sample else { continue };
+
+                if Some(stream_idx) == audio_stream_index {
+                    if dec_tx.send(DecodeMsg::Audio(MtaSend(sample))).is_err() {
+                        break; // compute thread already gone (errored) - stop feeding it
+                    }
+                    continue;
+                }
+                if stream_idx != video_stream_index {
+                    continue;
+                }
+
+                let (bgra, stride) = unsafe { read_sample_bgra(&sample, width, height) }?;
+                let (r, g, b) = split_bgra_planes(&bgra, width, height, stride);
+                if dec_tx.send(DecodeMsg::Video { r, g, b }).is_err() {
+                    break; // compute thread already gone (errored) - stop feeding it
+                }
+            }
+            Ok(())
+        })
+        .expect("failed to spawn decode thread");
+
+    let compute_handle = std::thread::Builder::new()
+        .name("wavefold-mf-compute".into())
+        .spawn(move || -> Result<()> {
+            for msg in dec_rx {
+                let out = match msg {
+                    DecodeMsg::Audio(sample) => EncodeMsg::Audio(sample),
+                    DecodeMsg::Video { r, g, b } => {
+                        let (r2, g2, b2) = dct.process_rgb(&r, &g, &b, width, height, cutoff)?;
+                        EncodeMsg::Video { r: r2, g: g2, b: b2 }
+                    }
+                };
+                if enc_tx.send(out).is_err() {
+                    break; // encode thread already gone (errored) - stop feeding it
+                }
+            }
+            Ok(())
+        })
+        .expect("failed to spawn compute thread");
+
+    let progress_tx = tx.clone();
+    let encode_writer = MtaSend(writer);
+    let encode_handle = std::thread::Builder::new()
+        .name("wavefold-mf-encode".into())
+        .spawn(move || -> Result<u64> {
+            unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok().context("encode thread: failed to join MTA")?;
+            let _com_guard = ComGuard;
+            let encode_writer = encode_writer;
+            let writer = encode_writer.0;
+
+            let mut frame_idx = 0u64;
+            let mut pts_100ns = 0i64;
+            for msg in enc_rx {
+                match msg {
+                    EncodeMsg::Audio(sample) => {
+                        unsafe { writer.WriteSample(1, &sample.0) }.context("failed to write passthrough audio sample")?;
+                    }
+                    EncodeMsg::Video { r, g, b } => {
+                        let out_bytes = join_bgra_planes(width, height, &r, &g, &b);
+                        let out_sample = unsafe {
+                            let buffer = MFCreateMemoryBuffer(out_bytes.len() as u32).context("failed to allocate output buffer")?;
+                            let mut dest: *mut u8 = std::ptr::null_mut();
+                            buffer.Lock(&mut dest, None, None).context("failed to lock output buffer")?;
+                            std::ptr::copy_nonoverlapping(out_bytes.as_ptr(), dest, out_bytes.len());
+                            buffer.Unlock().context("failed to unlock output buffer")?;
+                            buffer.SetCurrentLength(out_bytes.len() as u32).context("failed to set output buffer length")?;
+
+                            let out_sample = MFCreateSample().context("failed to create output sample")?;
+                            out_sample.AddBuffer(&buffer).context("failed to attach output buffer")?;
+                            out_sample.SetSampleTime(pts_100ns).context("failed to set sample time")?;
+                            out_sample.SetSampleDuration(frame_duration_100ns).context("failed to set sample duration")?;
+                            out_sample
+                        };
+                        unsafe { writer.WriteSample(stream_index, &out_sample) }.context("failed to write encoded sample")?;
+                        pts_100ns += frame_duration_100ns;
+
+                        frame_idx += 1;
+                        let _ = progress_tx.send(PipelineMsg::Progress { current: frame_idx, total: total_frames });
+                    }
+                }
+            }
+
+            unsafe { writer.Finalize() }.context("failed to finalize output")?;
+            Ok(frame_idx)
+        })
+        .expect("failed to spawn encode thread");
+
+    // Join all three unconditionally before propagating any error - `?`
+    // on the first `.join()` that comes back `Err` would return from this
+    // function (dropping `run_inner`'s `_mf_guard`/`_com_guard`, which
+    // call `MFShutdown`/`CoUninitialize`, and triggering its
+    // failed-encode `remove_file` cleanup) while the other two threads
+    // could still be mid-flight - e.g. the encode thread still inside
+    // `writer.Finalize()` on a file `remove_file` is about to delete out
+    // from under it. Collecting every `Result` first guarantees all three
+    // threads have actually finished by the time any of that runs.
+    let decode_result = decode_handle.join().expect("decode thread panicked");
+    let compute_result = compute_handle.join().expect("compute thread panicked");
+    let encode_result = encode_handle.join().expect("encode thread panicked");
+
+    decode_result?;
+    compute_result?;
+    let frame_idx = encode_result?;
 
     info!(frames = frame_idx, path = %output_path.display(), "encode complete");
     let _ = tx.send(PipelineMsg::Log(format!("wrote {frame_idx} frames to {}", output_path.display())));
