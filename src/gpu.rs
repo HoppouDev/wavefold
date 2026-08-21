@@ -94,10 +94,11 @@ pub struct DctGpu {
     // submit all 3 channels' work before blocking on any of them, instead
     // of forcing a full stall-and-resume round trip per channel — slots
     // must stay physically separate since each channel's GPU work is
-    // in flight concurrently. Only used by `DctAlgorithm::Matmul` (the
-    // `Fft` path below is already a multi-stage blocking round trip per
-    // channel, so this specific overlap optimization doesn't apply there
-    // — see `encode_plane_fft`'s doc comment).
+    // in flight concurrently. Only used by `DctAlgorithm::Matmul`; the
+    // `Fft` path gets the same submit-all-3-then-block-once treatment via
+    // `process_rgb_fft` instead, since its per-channel dispatch chain is
+    // planned into a caller-supplied `Vec<Item>` rather than these fixed
+    // per-slot buffers (see `encode_plane_fft`'s doc comment).
     buffers: [RefCell<Option<PlaneBuffers>>; 3],
     algorithm: DctAlgorithm,
     // Always built (cheap — just pipeline objects) regardless of
@@ -263,10 +264,11 @@ impl DctGpu {
     /// one frame at once: all three channels' work is submitted to the GPU,
     /// and all three `map_async` readbacks are issued, before blocking on
     /// any of them — one `device.poll` drives all three to completion
-    /// instead of a full stall-and-resume round trip per channel. Only
-    /// applies to `DctAlgorithm::Matmul`; the `Fft` path processes each
-    /// channel through its own several-stage blocking sequence (see
-    /// `encode_plane_fft`) since it doesn't fit this single-submit shape.
+    /// instead of a full stall-and-resume round trip per channel. Both
+    /// `DctAlgorithm::Matmul` (below) and `DctAlgorithm::Fft` (via
+    /// `process_rgb_fft`) follow this same submit-all-then-block-once
+    /// shape; only the single-plane `process_plane` API still does one
+    /// submit per channel; see `encode_plane_fft`'s doc comment.
     pub fn process_rgb(
         &self,
         r: &[f32],
@@ -277,10 +279,7 @@ impl DctGpu {
         cutoff: f32,
     ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
         if self.algorithm == DctAlgorithm::Fft {
-            let r_out = self.encode_plane_fft(r, width, height, cutoff)?;
-            let g_out = self.encode_plane_fft(g, width, height, cutoff)?;
-            let b_out = self.encode_plane_fft(b, width, height, cutoff)?;
-            return Ok((r_out, g_out, b_out));
+            return self.process_rgb_fft(r, g, b, width, height, cutoff);
         }
         self.encode_plane(0, r, width, height, cutoff)?;
         self.encode_plane(1, g, width, height, cutoff)?;
@@ -417,11 +416,9 @@ impl DctGpu {
     ///
     /// Every dispatch for the whole plane - forward row, forward col +
     /// mask, inverse col, inverse row + clamp, and every FFT sub-stage
-    /// within those - is planned into one `Vec<Item>` (pure buffer/bind-
-    /// group creation, no GPU work yet) and then executed inside a single
-    /// compute pass, one `queue.submit`, one blocking readback at the
-    /// end - matching `encode_plane`'s one-submit-per-plane shape instead
-    /// of each stage doing its own round trip. An earlier version did
+    /// within those - is planned into `items` (pure buffer/bind-group
+    /// creation, no GPU work yet), returning the final output buffer
+    /// without submitting or reading anything back. An earlier version did
     /// submit-and-block per stage (confirmed via direct benchmarking:
     /// ~8-10 blocking round trips per plane, and the FFT path came out
     /// 1.3-1.7x *slower* than the tiled GEMM at 1920x1080/1920x1082/
@@ -432,7 +429,15 @@ impl DctGpu {
     /// `encode_plane` above already relies on (WebGPU compute passes
     /// guarantee per-pass dispatch ordering); this reuses that same
     /// guarantee at a larger scale.
-    fn encode_plane_fft(&self, pixels: &[f32], width: u32, height: u32, cutoff: f32) -> Result<Vec<f32>> {
+    ///
+    /// Callers append their own channel's chain into a shared `items`
+    /// Vec — `encode_plane_fft` uses one per call (one submit per plane,
+    /// for the single-plane `process_plane` API); `process_rgb_fft` calls
+    /// this three times into the *same* `items` before a single submit,
+    /// so all three RGB channels' work goes to the GPU in one shot instead
+    /// of three separate blocking round trips (see that function's doc
+    /// comment for why that distinction matters).
+    fn plan_channel_fft<'a>(&'a self, items: &mut Vec<Item<'a>>, pixels: &[f32], width: u32, height: u32, cutoff: f32) -> Result<wgpu::Buffer> {
         if width == 0 || height == 0 {
             bail!("process_plane: width and height must both be non-zero (got {width}x{height})");
         }
@@ -447,10 +452,6 @@ impl DctGpu {
         let row_factors = fft_eligible(w);
         let col_factors = fft_eligible(h);
         let threshold = cutoff.clamp(0.0, 2.0) + f32::EPSILON;
-        let real_bytes = (pixels.len() * std::mem::size_of::<f32>()) as u64;
-
-        use wgpu::util::DeviceExt;
-        let mut items: Vec<Item> = Vec::new();
 
         let input_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("fft plane input"),
@@ -462,51 +463,53 @@ impl DctGpu {
         // passes never need a transpose - a row-major width x height
         // buffer is already `height` contiguous length-`width` batches.
         let stage1 = match &row_factors {
-            Some(factors) => self.plan_fft_dct2(&mut items, &input_buf, w, factors, h),
-            None => self.plan_gemm_pass(&mut items, &input_buf, width, height, true, false, false, false, threshold),
+            Some(factors) => self.plan_fft_dct2(items, &input_buf, w, factors, h),
+            None => self.plan_gemm_pass(items, &input_buf, width, height, true, false, false, false, threshold),
         };
 
         // Stage 2: forward column transform + cutoff mask.
         let stage2 = match &col_factors {
             Some(factors) => {
-                let transposed = self.plan_transpose(&mut items, &stage1, w, h);
-                let col_dct = self.plan_fft_dct2(&mut items, &transposed, h, factors, w);
-                let back = self.plan_transpose(&mut items, &col_dct, h, w);
-                self.plan_mask(&mut items, &back, w, h, threshold)
+                let transposed = self.plan_transpose(items, &stage1, w, h);
+                let col_dct = self.plan_fft_dct2(items, &transposed, h, factors, w);
+                let back = self.plan_transpose(items, &col_dct, h, w);
+                self.plan_mask(items, &back, w, h, threshold)
             }
-            None => self.plan_gemm_pass(&mut items, &stage1, width, height, false, false, true, false, threshold),
+            None => self.plan_gemm_pass(items, &stage1, width, height, false, false, true, false, threshold),
         };
 
         // Stage 3: inverse column transform.
         let stage3 = match &col_factors {
             Some(factors) => {
-                let transposed = self.plan_transpose(&mut items, &stage2, w, h);
-                let col_idct = self.plan_fft_dct3(&mut items, &transposed, h, factors, w);
-                self.plan_transpose(&mut items, &col_idct, h, w)
+                let transposed = self.plan_transpose(items, &stage2, w, h);
+                let col_idct = self.plan_fft_dct3(items, &transposed, h, factors, w);
+                self.plan_transpose(items, &col_idct, h, w)
             }
-            None => self.plan_gemm_pass(&mut items, &stage2, width, height, false, true, false, false, threshold),
+            None => self.plan_gemm_pass(items, &stage2, width, height, false, true, false, false, threshold),
         };
 
         // Stage 4: inverse row transform + clamp to pixel range.
         let final_buf = match &row_factors {
             Some(factors) => {
-                let out = self.plan_fft_dct3(&mut items, &stage3, w, factors, h);
-                self.plan_clamp(&mut items, &out, w * h)
+                let out = self.plan_fft_dct3(items, &stage3, w, factors, h);
+                self.plan_clamp(items, &out, w * h)
             }
-            None => self.plan_gemm_pass(&mut items, &stage3, width, height, true, true, false, true, threshold),
+            None => self.plan_gemm_pass(items, &stage3, width, height, true, true, false, true, threshold),
         };
 
-        let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("fft plane staging"),
-            size: real_bytes,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        Ok(final_buf)
+    }
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("fft plane encoder") });
+    /// Executes every planned dispatch in `items` inside one compute pass,
+    /// then copies each of `outputs` into a matching staging buffer, all
+    /// within one `queue.submit`. Shared by `encode_plane_fft` (one output)
+    /// and `process_rgb_fft` (three) so both submit exactly once regardless
+    /// of channel count.
+    fn submit_fft_items(&self, items: &[Item], outputs: &[(&wgpu::Buffer, &wgpu::Buffer, u64)]) {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("fft encoder") });
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("fft plane pass"), timestamp_writes: None });
-            for item in &items {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("fft pass"), timestamp_writes: None });
+            for item in items {
                 match item {
                     Item::Fft { pipeline, bind_group, groups } => {
                         pass.set_pipeline(pipeline);
@@ -522,8 +525,29 @@ impl DctGpu {
                 }
             }
         }
-        encoder.copy_buffer_to_buffer(&final_buf, 0, &staging_buf, 0, real_bytes);
+        for (src, dst, size) in outputs {
+            encoder.copy_buffer_to_buffer(src, 0, dst, 0, *size);
+        }
         self.queue.submit(Some(encoder.finish()));
+    }
+
+    /// Single-plane entry point for `DctAlgorithm::Fft`, used by
+    /// `process_plane`: plans one channel's chain, submits once, blocks
+    /// once on the readback. See `plan_channel_fft`'s doc comment for the
+    /// planning/submit split this builds on.
+    fn encode_plane_fft(&self, pixels: &[f32], width: u32, height: u32, cutoff: f32) -> Result<Vec<f32>> {
+        let real_bytes = (pixels.len() * std::mem::size_of::<f32>()) as u64;
+        let mut items: Vec<Item> = Vec::new();
+        let final_buf = self.plan_channel_fft(&mut items, pixels, width, height, cutoff)?;
+
+        let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fft plane staging"),
+            size: real_bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        self.submit_fft_items(&items, &[(&final_buf, &staging_buf, real_bytes)]);
 
         let slice = staging_buf.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -537,6 +561,71 @@ impl DctGpu {
         drop(data);
         staging_buf.unmap();
         Ok(result)
+    }
+
+    /// `DctAlgorithm::Fft` counterpart to `process_rgb`'s Matmul branch:
+    /// plans all three RGB channels' dispatch chains into one shared
+    /// `Vec<Item>` (via `plan_channel_fft`), submits all of it in a single
+    /// `queue.submit`, issues all three `map_async` readbacks, then blocks
+    /// on one `device.poll` for all three at once. Calling
+    /// `encode_plane_fft` three times in a row (the previous design) meant
+    /// three separate submit-and-block round trips per frame: the GPU sat
+    /// idle while the host built the next channel's buffers/bind groups,
+    /// then the host sat blocked in `poll_bounded` while the GPU worked —
+    /// alternating idle time on both sides every frame, which is what
+    /// showed up as low GPU utilization (confirmed by a user report: ~40%
+    /// GPU usage encoding to AV1 hardware with this algorithm) despite a
+    /// fast wall-clock encode.
+    fn process_rgb_fft(&self, r: &[f32], g: &[f32], b: &[f32], width: u32, height: u32, cutoff: f32) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let real_bytes = (r.len() * std::mem::size_of::<f32>()) as u64;
+        let mut items: Vec<Item> = Vec::new();
+        let r_final = self.plan_channel_fft(&mut items, r, width, height, cutoff)?;
+        let g_final = self.plan_channel_fft(&mut items, g, width, height, cutoff)?;
+        let b_final = self.plan_channel_fft(&mut items, b, width, height, cutoff)?;
+
+        let make_staging = |label: &str| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: real_bytes,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        };
+        let r_staging = make_staging("fft rgb staging r");
+        let g_staging = make_staging("fft rgb staging g");
+        let b_staging = make_staging("fft rgb staging b");
+
+        self.submit_fft_items(
+            &items,
+            &[(&r_final, &r_staging, real_bytes), (&g_final, &g_staging, real_bytes), (&b_final, &b_staging, real_bytes)],
+        );
+
+        let begin_read = |buf: &wgpu::Buffer| {
+            let slice = buf.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |res| {
+                let _ = tx.send(res);
+            });
+            rx
+        };
+        let r_rx = begin_read(&r_staging);
+        let g_rx = begin_read(&g_staging);
+        let b_rx = begin_read(&b_staging);
+        self.poll_bounded()?;
+
+        let finish_read = |buf: &wgpu::Buffer, rx: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>| -> Result<Vec<f32>> {
+            rx.recv().context("gpu map channel closed")??;
+            let slice = buf.slice(..);
+            let data = slice.get_mapped_range().context("failed to map gpu buffer")?;
+            let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+            drop(data);
+            buf.unmap();
+            Ok(result)
+        };
+        let r_out = finish_read(&r_staging, r_rx)?;
+        let g_out = finish_read(&g_staging, g_rx)?;
+        let b_out = finish_read(&b_staging, b_rx)?;
+        Ok((r_out, g_out, b_out))
     }
 
     /// Appends a forward DCT-II FFT sequence (combined interleave+digit-
