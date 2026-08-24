@@ -9,15 +9,18 @@
 mod ui;
 
 use clap::{Parser, Subcommand};
+use std::io::Write;
+use std::path::PathBuf;
 use wavefold::codec::Codec;
 use wavefold::dct_backend::{ComputeBackend, DctAlgorithm};
 use wavefold::media_backend::MediaBackendChoice;
 use wavefold::pipeline::{self, PipelineMsg};
-use std::io::Write;
-use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "wavefold", about = "Apply a whole-frame DCT distortion effect to video — GUI or headless")]
+#[command(
+    name = "wavefold",
+    about = "Apply a whole-frame DCT distortion effect to video — GUI or headless"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -61,10 +64,14 @@ fn main() {
     // a double-click launch, which has no parent console to attach to.
     #[cfg(windows)]
     unsafe {
-        let _ = windows::Win32::System::Console::AttachConsole(windows::Win32::System::Console::ATTACH_PARENT_PROCESS);
+        let _ = windows::Win32::System::Console::AttachConsole(
+            windows::Win32::System::Console::ATTACH_PARENT_PROCESS,
+        );
     }
 
-    tracing_subscriber::fmt::init();
+    let base = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
+    let filter = tracing_subscriber::EnvFilter::new(format!("{base},winit=warn,iced_winit=warn"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
     match Cli::parse().command {
         Command::Gui => {
             if let Err(e) = run_gui() {
@@ -72,8 +79,24 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Encode { input, output, cutoff, encoder, backend, dct_algorithm, media_backend } => {
-            run_encode(input, output, cutoff, encoder, backend, dct_algorithm, media_backend);
+        Command::Encode {
+            input,
+            output,
+            cutoff,
+            encoder,
+            backend,
+            dct_algorithm,
+            media_backend,
+        } => {
+            run_encode(
+                input,
+                output,
+                cutoff,
+                encoder,
+                backend,
+                dct_algorithm,
+                media_backend,
+            );
         }
     }
 }
@@ -98,9 +121,28 @@ fn load_icon() -> iced::window::Icon {
         .expect("embedded app icon has valid dimensions")
 }
 
-fn run_encode(input: PathBuf, output: PathBuf, cutoff: f32, encoder: Codec, backend: ComputeBackend, dct_algorithm: DctAlgorithm, media_backend: MediaBackendChoice) {
+fn run_encode(
+    input: PathBuf,
+    output: PathBuf,
+    cutoff: f32,
+    encoder: Codec,
+    backend: ComputeBackend,
+    dct_algorithm: DctAlgorithm,
+    media_backend: MediaBackendChoice,
+) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let handle = std::thread::spawn(move || pipeline::run(&input, &output, cutoff, encoder, backend, dct_algorithm, media_backend, tx));
+    let handle = std::thread::spawn(move || {
+        pipeline::run(
+            &input,
+            &output,
+            cutoff,
+            encoder,
+            backend,
+            dct_algorithm,
+            media_backend,
+            tx,
+        )
+    });
 
     let mut had_error = false;
     while let Some(msg) = rx.blocking_recv() {
