@@ -10,7 +10,9 @@ use gstreamer_video::prelude::*;
 use rayon::prelude::*;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use tokio::sync::mpsc::UnboundedSender as Sender;
 use tracing::{debug, error, info, warn};
 
@@ -153,11 +155,53 @@ fn join_rgb_planes(width: u32, height: u32, r: &[f32], g: &[f32], b: &[f32]) -> 
     Ok(buffer)
 }
 
-/// Runs the DCT backend over one decoded RGB sample and pushes the result
-/// into `appsrc`, copying the original buffer's PTS/DTS/duration across
-/// unchanged — GStreamer expresses timestamps in nanoseconds uniformly
-/// throughout the whole pipeline, so (unlike the old ffmpeg-next path)
-/// there is no timebase to rescale between.
+/// One decoded frame's RGB planes plus the original buffer's timing, handed
+/// off from the decode side (appsink's callback) to the compute thread.
+struct DecodedFrame {
+    r: Vec<f32>,
+    g: Vec<f32>,
+    b: Vec<f32>,
+    width: u32,
+    height: u32,
+    pts: Option<gst::ClockTime>,
+    dts: Option<gst::ClockTime>,
+    duration: Option<gst::ClockTime>,
+}
+
+/// One DCT'd frame's RGB planes plus timing, handed off from the compute
+/// thread to the encode thread.
+struct ComputedFrame {
+    r: Vec<f32>,
+    g: Vec<f32>,
+    b: Vec<f32>,
+    width: u32,
+    height: u32,
+    pts: Option<gst::ClockTime>,
+    dts: Option<gst::ClockTime>,
+    duration: Option<gst::ClockTime>,
+}
+
+/// `Eos` is an explicit message rather than relying on channel closure,
+/// since appsink's `new_preroll`/`new_sample` closures each hold their own
+/// clone of the decode-side sender for as long as the pipeline exists — the
+/// channel itself never naturally closes just because `eos` fired. See
+/// `run_inner`'s decode/compute/encode threading doc comment for why these
+/// three stages are split across threads at all.
+enum DecodeMsg {
+    Video(DecodedFrame),
+    Eos,
+}
+
+enum EncodeMsg {
+    Video(ComputedFrame),
+    Eos,
+}
+
+/// Pulls one decoded RGB sample and sends its planes (plus timing) to the
+/// compute thread — deliberately *not* running the DCT or pushing into
+/// `appsrc` itself, so this callback returns fast and GStreamer's own
+/// decode-side threading can keep decoding ahead instead of blocking on GPU
+/// compute/encode (see `run_inner`'s threading doc comment).
 ///
 /// NOTE: `appsink` redelivers its very first buffer twice — once via
 /// `new_preroll` (to complete the pipeline's PAUSED preroll) and once more
@@ -167,14 +211,9 @@ fn join_rgb_planes(width: u32, height: u32, r: &[f32], g: &[f32], b: &[f32]) -> 
 /// every one of `tests/integration.rs`'s exact-frame-count assertions was
 /// off by exactly one. `last_pts` dedups by skipping a call whose PTS
 /// matches the immediately preceding one.
-fn process_and_forward(
+fn decode_and_send(
     sample: &gst::Sample,
-    dct: &Mutex<Box<dyn DctBackend>>,
-    appsrc: &gst_app::AppSrc,
-    cutoff: f32,
-    frame_idx: &AtomicU64,
-    total_frames: u64,
-    tx: &Sender<PipelineMsg>,
+    dec_tx: &SyncSender<DecodeMsg>,
     last_pts: &Mutex<Option<gst::ClockTime>>,
 ) -> Result<(), gst::FlowError> {
     let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
@@ -192,26 +231,13 @@ fn process_and_forward(
     let (width, height) = (in_frame.width(), in_frame.height());
 
     let (r, g, b) = split_rgb_planes(&in_frame);
-    let (r2, g2, b2) = dct
-        .lock()
-        .expect("DCT backend mutex poisoned")
-        .process_rgb(&r, &g, &b, width, height, cutoff)
-        .map_err(|e| {
-            error!("DCT backend failed: {e:#}");
-            gst::FlowError::Error
-        })?;
-    let mut out_buffer = join_rgb_planes(width, height, &r2, &g2, &b2).map_err(|_| gst::FlowError::Error)?;
-    {
-        let out_buffer_mut = out_buffer.get_mut().ok_or(gst::FlowError::Error)?;
-        out_buffer_mut.set_pts(buffer.pts());
-        out_buffer_mut.set_dts(buffer.dts());
-        out_buffer_mut.set_duration(buffer.duration());
-    }
-
-    let current = frame_idx.fetch_add(1, Ordering::Relaxed) + 1;
-    let _ = tx.send(PipelineMsg::Progress { current, total: total_frames });
-
-    appsrc.push_buffer(out_buffer).map(|_| ()).map_err(|_| gst::FlowError::Error)
+    let frame = DecodedFrame { r, g, b, width, height, pts: buffer.pts(), dts: buffer.dts(), duration: buffer.duration() };
+    // A closed channel here means the compute thread already stopped
+    // (its own error already reached the bus via `post_error_message`
+    // below) — mapping to `FlowError::Error` just stops this branch from
+    // trying to push more frames into a pipeline that's already winding
+    // down, not a second, competing error report.
+    dec_tx.send(DecodeMsg::Video(frame)).map_err(|_| gst::FlowError::Error)
 }
 
 fn run_inner(
@@ -229,8 +255,6 @@ fn run_inner(
 
     let input_str = input_path.to_str().context("input path is not valid UTF-8")?;
     let output_str = output_path.to_str().context("output path is not valid UTF-8")?;
-
-    let dct: Arc<Mutex<Box<dyn DctBackend>>> = Arc::new(Mutex::new(dct));
 
     let profile = codec_profile(codec);
     debug!(element = profile.element_factory_name, "video encoder selected");
@@ -250,6 +274,21 @@ fn run_inner(
     // framerate) are set once the decoded video pad's caps are known, in
     // `connect_pad_added` below — appsrc has no upstream to negotiate
     // dimensions from, unlike appsink.
+    //
+    // Deliberately *no* queue between appsrc and videoconvert (tried once,
+    // reverted): `process_and_forward`'s `appsrc.push_buffer()` relies on
+    // the encode chain being synchronous to surface downstream failures —
+    // e.g. `vp9enc` into `qtmux` (see `codec_profile`'s doc comment on that
+    // gap) fails negotiation but never posts its own bus error, so without
+    // a queue the `GST_FLOW_NOT_NEGOTIATED` return propagates synchronously
+    // back through `push_buffer` into `process_and_forward`'s `Err`, which
+    // is what makes that failure visible at all. A queue here decouples
+    // that return value from the actual downstream failure, which starts
+    // happening asynchronously on the queue's own thread — confirmed this
+    // turns that specific failure into a silent hang (no bus error, no
+    // flow-return propagation, `rx.blocking_recv()` never unblocks) instead
+    // of the clean, fast error `tests/integration.rs` already relies on
+    // tolerating for exactly this codec/muxer combination.
     let appsrc = gst_app::AppSrc::builder().format(gst::Format::Time).build();
     let venc_convert = gst::ElementFactory::make("videoconvert").build().context("failed to create videoconvert")?;
     let encoder = gst::ElementFactory::make(profile.element_factory_name)
@@ -313,7 +352,16 @@ fn run_inner(
     // before frames reach appsink. Distinct from `venc_convert` above,
     // which converts DCT'd RGB back to the encoder's format on the way out.
     let dec_convert = gst::ElementFactory::make("videoconvert").build().context("failed to create decode-side videoconvert")?;
-    pipeline.add_many([&aud_queue, &dec_convert]).context("failed to add audio/decode-convert elements")?;
+    // `dec_queue` gives decoding its own thread, separate from the one
+    // appsink's callback (GPU DCT dispatch) runs on - decodebin's video pad
+    // links directly into a queue's sink pad below instead of straight into
+    // `dec_convert`/`appsink`, so decodebin's internal decode thread can
+    // keep decoding ahead instead of blocking on the appsink callback
+    // returning. See `venc_pre_queue`'s doc comment above for the matching
+    // encode-side half of this fix.
+    let dec_queue = gst::ElementFactory::make("queue").build().context("failed to create decode queue")?;
+    pipeline.add_many([&aud_queue, &dec_queue, &dec_convert]).context("failed to add audio/decode-convert elements")?;
+    dec_queue.link(&dec_convert).context("failed to link decode queue -> videoconvert")?;
 
     let appsink = gst_app::AppSink::builder()
         .caps(&gst::Caps::builder("video/x-raw").field("format", "RGB").build())
@@ -326,60 +374,162 @@ fn run_inner(
     let last_pts: Arc<Mutex<Option<gst::ClockTime>>> = Arc::new(Mutex::new(None));
     let fps_holder: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
 
+    // Decode (appsink's own callback thread, driven by `dec_queue`) / GPU
+    // DCT compute / encode (`appsrc.push_buffer` and everything
+    // synchronously downstream of it) run on three separate stages
+    // connected by bounded channels, instead of appsink's callback doing
+    // all three inline — the naive single-callback version left the GPU
+    // idle while waiting on the next decoded frame and vice versa
+    // (confirmed: a user report of ~9-15% GPU utilization encoding to AV1
+    // hardware despite the DCT compute step being real GPU work, and
+    // `dec_queue` alone — decode overlapping with compute+encode, added
+    // first as a narrower fix — made no measurable difference, meaning
+    // compute and encode were the two stages actually serialized here).
+    // `backends::media_foundation` hit the identical problem and fixed it
+    // the identical way (see that module's own decode/compute/encode
+    // threading doc comment) since Media Foundation's reader/writer API
+    // has no `queue`-element equivalent to lean on either.
+    //
+    // A plain `queue` element between `appsrc` and the encoder (tried
+    // once, reverted — see the doc comment above `venc_convert`'s
+    // creation) can't be used for the same purpose: it breaks this
+    // pipeline's reliance on `appsrc.push_buffer()` synchronously
+    // reflecting downstream encode/mux failures. This channel-based
+    // design keeps that guarantee by having the *encode* thread call
+    // `appsrc.push_buffer()` — still synchronous, just on its own thread
+    // now — and explicitly `post_error_message`ing onto the pipeline's own
+    // bus on failure, which the existing bus-reading loop below already
+    // picks up unchanged, instead of relying on a queue's implicit
+    // (and in practice unreliable for at least one codec/muxer gap)
+    // error propagation.
+    //
+    // Bounded (not unbounded) channels so a slow stage applies backpressure
+    // instead of buffering the whole video's worth of decoded frames in
+    // memory; depth 2 is enough for every adjacent pair of stages to have
+    // one frame in flight and one buffered, the minimum for real overlap.
+    const CHANNEL_DEPTH: usize = 2;
+    let (dec_tx, dec_rx) = sync_channel::<DecodeMsg>(CHANNEL_DEPTH);
+    let (enc_tx, enc_rx) = sync_channel::<EncodeMsg>(CHANNEL_DEPTH);
+
+    let compute_pipeline = pipeline.clone();
+    let compute_handle = thread::Builder::new()
+        .name("wavefold-gst-compute".into())
+        .spawn(move || {
+            for msg in dec_rx {
+                let frame = match msg {
+                    DecodeMsg::Video(frame) => frame,
+                    DecodeMsg::Eos => {
+                        let _ = enc_tx.send(EncodeMsg::Eos);
+                        return;
+                    }
+                };
+                match dct.process_rgb(&frame.r, &frame.g, &frame.b, frame.width, frame.height, cutoff) {
+                    Ok((r, g, b)) => {
+                        let out = ComputedFrame {
+                            r,
+                            g,
+                            b,
+                            width: frame.width,
+                            height: frame.height,
+                            pts: frame.pts,
+                            dts: frame.dts,
+                            duration: frame.duration,
+                        };
+                        if enc_tx.send(EncodeMsg::Video(out)).is_err() {
+                            return; // encode thread already gone (errored) - stop feeding it
+                        }
+                    }
+                    Err(e) => {
+                        error!("DCT backend failed: {e:#}");
+                        compute_pipeline.post_error_message(gst::error_msg!(gst::LibraryError::Failed, ["DCT backend failed: {e:#}"]));
+                        return;
+                    }
+                }
+            }
+        })
+        .expect("failed to spawn compute thread");
+
+    let encode_appsrc = appsrc.clone();
+    let encode_pipeline = pipeline.clone();
+    let encode_frame_idx = frame_idx.clone();
+    let encode_total_frames = total_frames.clone();
+    let encode_tx = tx.clone();
+    let encode_handle = thread::Builder::new()
+        .name("wavefold-gst-encode".into())
+        .spawn(move || {
+            for msg in enc_rx {
+                let frame = match msg {
+                    EncodeMsg::Video(frame) => frame,
+                    EncodeMsg::Eos => {
+                        let _ = encode_appsrc.end_of_stream();
+                        return;
+                    }
+                };
+                let out_buffer = match join_rgb_planes(frame.width, frame.height, &frame.r, &frame.g, &frame.b) {
+                    Ok(mut buf) => {
+                        if let Some(buf_mut) = buf.get_mut() {
+                            buf_mut.set_pts(frame.pts);
+                            buf_mut.set_dts(frame.dts);
+                            buf_mut.set_duration(frame.duration);
+                        }
+                        buf
+                    }
+                    Err(e) => {
+                        error!("failed to assemble output frame: {e:#}");
+                        encode_pipeline.post_error_message(gst::error_msg!(gst::LibraryError::Failed, ["failed to assemble output frame: {e:#}"]));
+                        return;
+                    }
+                };
+                if let Err(e) = encode_appsrc.push_buffer(out_buffer) {
+                    error!("failed to push encoded frame: {e:#}");
+                    encode_pipeline.post_error_message(gst::error_msg!(gst::LibraryError::Failed, ["failed to push encoded frame: {e:#}"]));
+                    return;
+                }
+                let current = encode_frame_idx.fetch_add(1, Ordering::Relaxed) + 1;
+                let _ = encode_tx.send(PipelineMsg::Progress { current, total: encode_total_frames.load(Ordering::Relaxed) });
+            }
+        })
+        .expect("failed to spawn encode thread");
+
     // NOTE: appsink delivers its very first buffer via `new_preroll` (while
     // the pipeline is still PAUSED) and every subsequent one via
-    // `new_sample` (once PLAYING) — both must forward into appsrc
-    // identically, or the video branch never gets its first buffer and the
-    // *whole pipeline's* PAUSED->PLAYING transition stalls forever (the
-    // muxer can't complete preroll on a starved pad). appsink's EOS is
-    // likewise not automatically forwarded to appsrc and must be done here
-    // explicitly, or the encode branch never learns decoding finished.
+    // `new_sample` (once PLAYING) — both must forward identically, or the
+    // video branch never gets its first buffer and the *whole pipeline's*
+    // PAUSED->PLAYING transition stalls forever (the muxer can't complete
+    // preroll on a starved pad). appsink's EOS is likewise not automatically
+    // forwarded to appsrc and must be done here explicitly (via the compute/
+    // encode threads above), or the encode branch never learns decoding
+    // finished.
+    // `dec_tx` itself (not just a clone) is kept alive in `run_inner`'s own
+    // scope rather than moved into the `eos` closure below - the closures
+    // registered on `appsink` live as long as `pipeline` does (until this
+    // function returns), so if the pipeline never reaches a real EOS (e.g.
+    // it fails before ever reaching `Playing`), nothing would otherwise ever
+    // signal the compute/encode threads to stop, and joining them below
+    // would block forever. This clone is `run_inner`'s explicit fallback:
+    // sent unconditionally after the bus loop ends for any reason, so the
+    // threads always wind down before this function returns. A second Eos
+    // after the real one (the common case) is harmless — the compute thread
+    // already returned after the first one, so this later send just fails
+    // immediately with a disconnected-receiver error, which is ignored.
     {
-        let dct_preroll = dct.clone();
-        let dct_sample = dct.clone();
-        let appsrc_preroll = appsrc.clone();
-        let appsrc_sample = appsrc.clone();
-        let appsrc_eos = appsrc.clone();
-        let frame_idx_preroll = frame_idx.clone();
-        let frame_idx_sample = frame_idx.clone();
-        let total_frames_preroll = total_frames.clone();
-        let total_frames_sample = total_frames.clone();
-        let tx_preroll = tx.clone();
-        let tx_sample = tx.clone();
+        let dec_tx_preroll = dec_tx.clone();
+        let dec_tx_sample = dec_tx.clone();
+        let dec_tx_eos = dec_tx.clone();
         let last_pts_preroll = last_pts.clone();
         let last_pts_sample = last_pts.clone();
         appsink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
                 .new_preroll(move |sink| {
                     let sample = sink.pull_preroll().map_err(|_| gst::FlowError::Eos)?;
-                    process_and_forward(
-                        &sample,
-                        &dct_preroll,
-                        &appsrc_preroll,
-                        cutoff,
-                        &frame_idx_preroll,
-                        total_frames_preroll.load(Ordering::Relaxed),
-                        &tx_preroll,
-                        &last_pts_preroll,
-                    )
-                    .map(|()| gst::FlowSuccess::Ok)
+                    decode_and_send(&sample, &dec_tx_preroll, &last_pts_preroll).map(|()| gst::FlowSuccess::Ok)
                 })
                 .new_sample(move |sink| {
                     let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                    process_and_forward(
-                        &sample,
-                        &dct_sample,
-                        &appsrc_sample,
-                        cutoff,
-                        &frame_idx_sample,
-                        total_frames_sample.load(Ordering::Relaxed),
-                        &tx_sample,
-                        &last_pts_sample,
-                    )
-                    .map(|()| gst::FlowSuccess::Ok)
+                    decode_and_send(&sample, &dec_tx_sample, &last_pts_sample).map(|()| gst::FlowSuccess::Ok)
                 })
                 .eos(move |_sink| {
-                    let _ = appsrc_eos.end_of_stream();
+                    let _ = dec_tx_eos.send(DecodeMsg::Eos);
                 })
                 .build(),
         );
@@ -401,7 +551,7 @@ fn run_inner(
     let width_height_logged = Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let appsrc_for_pad = appsrc.clone();
-        let dec_convert_for_pad = dec_convert.clone();
+        let dec_queue_for_pad = dec_queue.clone();
         let aud_queue_for_pad = aud_queue.clone();
         let muxer_for_pad = muxer.clone();
         // NOTE: a *strong* clone of `pipeline` here would create a
@@ -468,9 +618,9 @@ fn run_inner(
                         .build(),
                 ));
 
-                let sinkpad = dec_convert_for_pad.static_pad("sink").expect("videoconvert has no sink pad");
+                let sinkpad = dec_queue_for_pad.static_pad("sink").expect("decode queue has no sink pad");
                 if let Err(e) = src_pad.link(&sinkpad) {
-                    error!("failed to link decoded video pad to videoconvert: {e:?}");
+                    error!("failed to link decoded video pad to decode queue: {e:?}");
                 }
             } else if name.starts_with("audio/") {
                 debug!("audio stream found: will pass through unchanged");
@@ -561,6 +711,16 @@ fn run_inner(
             }
         }
     }
+
+    // Unconditional fallback so the compute/encode threads always wind down
+    // before this function returns, even on a path where the pipeline never
+    // reached a real EOS (e.g. `set_state(Playing)` itself failed above) -
+    // see the doc comment on `dec_tx_eos`'s clone for why this can't just
+    // rely on `appsink`'s own `eos` callback alone.
+    let _ = dec_tx.send(DecodeMsg::Eos);
+    let _ = compute_handle.join();
+    let _ = encode_handle.join();
+
     let _ = pipeline.set_state(gst::State::Null);
 
     if let Some(e) = final_error {

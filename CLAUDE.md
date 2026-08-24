@@ -273,10 +273,11 @@ same basis math `dct_math.rs` → (GPU only) `shader.wgsl`.
   `GstreamerBackend::run` takes an already-resolved `dct: Box<dyn
   DctBackend>` (alongside `codec`) — `pipeline.rs`'s dispatcher builds it
   before calling in, this module never touches `ComputeBackend` at all.
-  `run_inner` wraps it in `Arc<Mutex<...>>` (the trait has `Send` as a
-  supertrait specifically so it can move into the `appsink` callback
-  below, which GStreamer invokes from its own streaming thread) before
-  building the pipeline. `PipelineMsg`'s shape (`Progress`/`Log`/`Done`/
+  `run_inner` moves it directly (no `Arc<Mutex<...>>` — the trait's `Send`
+  supertrait is what lets it move whole into the dedicated compute thread
+  below, which is the only thread that ever touches it, so no shared
+  mutable access needs guarding) before building the pipeline.
+  `PipelineMsg`'s shape (`Progress`/`Log`/`Done`/
   `Error` over a `tokio::sync::mpsc::UnboundedSender`, now defined in
   `media_backend.rs` rather than here) is unchanged from earlier
   ffmpeg-next implementation — whole point of the original GStreamer
@@ -289,29 +290,74 @@ same basis math `dct_math.rs` → (GPU only) `shader.wgsl`.
     what makes audio a pure passthrough (no decode/re-encode) without a
     manual demux/remux step: `decodebin` just exposes the still-encoded
     pad directly instead of auto-plugging a decoder for it. The video pad
-    goes `videoconvert ! appsink` (forced to `video/x-raw,format=RGB`);
-    the DCT step runs inside `appsink`'s callbacks (see below), pushing
-    into `appsrc ! videoconvert ! <encoder> ! [<parser> !] queue !
-    <muxer>`. The audio pad (once linked) goes straight `queue !
-    <muxer>`, no decode/encode element in between. No manual worker
-    threads or channels are needed for overlap the way the old
-    three-thread ffmpeg-next design required — GStreamer's own `queue`
-    elements provide that buffering/overlap for free; `queue` elements
-    exist in this graph for exactly that reason, not just as glue.
-  - **The DCT step lives in `process_and_forward`**, called from both of
-    `appsink`'s `new_preroll` and `new_sample` callbacks: pull the sample,
-    extract RGB planes via `gst_video::VideoFrameRef` (stride-aware, same
-    algorithm `split_rgb_planes`/`join_rgb_planes` always used, just
-    reading/writing `VideoFrameRef` instead of an `ff::frame::Video`),
-    call `DctBackend::process_rgb` (unchanged), reassemble into a new
-    buffer, copy the original buffer's PTS/DTS/duration across unchanged
-    (GStreamer expresses time in nanoseconds uniformly through the whole
-    pipeline — unlike the old ffmpeg-next path, there is no timebase to
-    rescale), and `appsrc.push_buffer(...)`.
+    goes `dec_queue ! videoconvert ! appsink` (forced to
+    `video/x-raw,format=RGB`), pushing into `appsrc ! videoconvert !
+    <encoder> ! [<parser> !] queue ! <muxer>`. The audio pad (once linked)
+    goes straight `queue ! <muxer>`, no decode/encode element in between.
+  - **Decode / GPU DCT compute / encode run on three threads connected by
+    bounded `std::sync::mpsc::sync_channel`s** (`decode_and_send` in
+    `appsink`'s callbacks → a `wavefold-gst-compute` thread → a
+    `wavefold-gst-encode` thread that owns `appsrc.push_buffer(...)`) —
+    *not* "GStreamer's own `queue` elements provide that overlap for
+    free," which is what this file used to claim and is only true for
+    `venc_queue`/`dec_queue` (protecting the muxer and letting decode run
+    ahead), not for the DCT compute step itself, which appsink's callback
+    used to run inline. Confirmed via a real user report (~9-15% GPU
+    utilization on Linux encoding to AV1 hardware despite the DCT compute
+    step being real GPU work) that decode/compute/encode were fully
+    serialized on one thread; adding `dec_queue` alone (decode overlapping
+    compute+encode) made no measurable difference, meaning compute and
+    encode were the two stages actually blocking each other. Fixed the
+    same way `backends::media_foundation` already had to (see that
+    module's own doc comment) — verified directly on real AMD/VAAPI
+    hardware via `/sys/class/drm/card*/device/gpu_busy_percent`: ~9% before
+    (single-callback), ~60% average (min 44, max 77) after, encoding
+    1280x720 to AV1 hardware.
+  - **A plain `queue` element between `appsrc` and the encoder was tried
+    first and reverted** — this pipeline relies on `appsrc.push_buffer()`
+    synchronously reflecting downstream encode/mux failures (see the
+    `vp9enc`-into-`qtmux` gap documented below: it fails negotiation but
+    never posts its own bus error, so *only* the synchronous
+    `GST_FLOW_NOT_NEGOTIATED` propagating back through `push_buffer` makes
+    that failure visible at all). A queue there decouples that return
+    value from the real failure, which then happens asynchronously on the
+    queue's own thread — confirmed this turns that specific failure into a
+    silent hang (`rx.blocking_recv()` never unblocks) instead of the
+    clean, fast error `tests/integration.rs` already tolerates for that
+    codec/muxer combination. The channel-based redesign above keeps the
+    guarantee instead of discarding it: the *encode* thread still calls
+    `appsrc.push_buffer()` synchronously (just off the appsink-callback
+    thread now), and explicitly `post_error_message`s onto the pipeline's
+    own bus on failure — which the existing bus-reading loop already
+    handles unchanged.
+  - **`decode_and_send`** (in `appsink`'s `new_preroll`/`new_sample`
+    callbacks) does only the fast half of the old `process_and_forward`:
+    pull the sample, extract RGB planes via `gst_video::VideoFrameRef`
+    (stride-aware, same algorithm `split_rgb_planes`/`join_rgb_planes`
+    always used), and send a `DecodedFrame` (planes + PTS/DTS/duration)
+    through a bounded channel to the compute thread — deliberately *not*
+    running the DCT or touching `appsrc` itself, so the callback returns
+    fast and doesn't block `decodebin`/`dec_queue`'s own decode-side
+    threading. The compute thread calls `DctBackend::process_rgb`
+    (unchanged) and forwards a `ComputedFrame` to the encode thread, which
+    reassembles the buffer via `join_rgb_planes`, copies PTS/DTS/duration
+    across (GStreamer expresses time in nanoseconds uniformly through the
+    whole pipeline — unlike the old ffmpeg-next path, there is no timebase
+    to rescale), and calls `appsrc.push_buffer(...)`.
+  - **`Eos` is an explicit message sent through the decode→compute→encode
+    channels, not inferred from channel closure** — `appsink`'s
+    `new_preroll`/`new_sample` closures each hold their own clone of the
+    decode-side sender for as long as the pipeline object exists, so the
+    channel never closes just because `eos` fired. `run_inner` also keeps
+    one extra clone in its own scope and sends a fallback `Eos`
+    unconditionally after the bus loop ends for *any* reason (including a
+    `set_state(Playing)` failure, where `appsink`'s own `eos` callback
+    never fires at all) — without it, joining the compute/encode threads
+    before returning could block forever.
   - **`appsink` delivers its very first buffer via `new_preroll` *and* the
     first `new_sample` call after reaching `Playing`** — both for the
     *same* buffer (confirmed empirically: both calls reported an identical
-    PTS). `process_and_forward` dedups via a shared `last_pts: Mutex<
+    PTS). `decode_and_send` dedups via a shared `last_pts: Mutex<
     Option<ClockTime>>`, skipping a call whose PTS matches the immediately
     preceding one. Skipping `new_preroll`'s forward entirely (only
     handling `new_sample`) is *not* a fix: without it, the video encode

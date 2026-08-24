@@ -70,7 +70,7 @@ fn main() {
     }
 
     let base = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
-    let filter = tracing_subscriber::EnvFilter::new(format!("{base},winit=warn,iced_winit=warn"));
+    let filter = tracing_subscriber::EnvFilter::new(format!("{base},iced_winit=warn"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
     match Cli::parse().command {
         Command::Gui => {

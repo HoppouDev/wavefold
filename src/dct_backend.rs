@@ -48,9 +48,9 @@ impl ComputeBackend {
     /// only affects the `Gpu` branch (see `DctAlgorithm`'s doc comment).
     pub fn build(&self, algorithm: DctAlgorithm) -> Result<Box<dyn DctBackend>> {
         match self {
-            ComputeBackend::Gpu => {
-                Ok(Box::new(DctGpu::new(algorithm).map_err(|e| anyhow!("GPU init failed: {e:#}"))?))
-            }
+            ComputeBackend::Gpu => Ok(Box::new(
+                DctGpu::new(algorithm).map_err(|e| anyhow!("GPU init failed: {e:#}"))?,
+            )),
             ComputeBackend::Cpu => Ok(Box::new(DctCpu::new())),
         }
     }
