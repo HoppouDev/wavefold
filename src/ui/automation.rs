@@ -18,6 +18,18 @@
 //! directly instead, which is exactly what those dialogs themselves
 //! produce, so there's no separate "automation-only" message variant to
 //! keep in sync with the real ones.
+//!
+//! **No authentication, by design, not oversight**: the loopback bind
+//! keeps this off the network, but any other local process can still
+//! connect and inject messages - including `Setup::Start`, which spawns a
+//! real background encode with attacker-chosen input/output paths. The
+//! `automation` Cargo feature gates *compilation*, not runtime access:
+//! once a build with it is running, the socket is open to anyone on the
+//! machine for as long as the process lives. That's the same tradeoff
+//! Chrome's remote-debugging port and most local dev/test control planes
+//! make - acceptable for a build nobody ships and that only runs when a
+//! developer deliberately launches it for testing, not something to carry
+//! into a build meant to run unattended or on a shared/multi-tenant host.
 
 use super::Message;
 use iced::futures::channel::mpsc;
