@@ -2,7 +2,25 @@ name: CI
 
 on:
   push:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "build.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Cross.toml"
+      - ".cargo/**"
+      - ".github/workflows/ci.yml"
   pull_request:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "build.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Cross.toml"
+      - ".cargo/**"
+      - ".github/workflows/ci.yml"
 
 jobs:
   build-and-test:
@@ -13,6 +31,13 @@ jobs:
     # ffmpeg-next-based pipeline): GStreamer's C ABI has been stable since
     # 1.0, so plain Ubuntu-packaged GStreamer just works — see CLAUDE.md's
     # "What this is" section for why that's specifically what changed.
+    # `wild` (.cargo/config.toml's linker for this target) is a dev-machine
+    # speed optimization only, not installed here — the env vars below
+    # override the linker back to plain `cc` with no extra rustflags for
+    # this job, so CI never needs to build/install wild at all.
+    env:
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ""
     steps:
       - name: Install GStreamer dev headers, plugins, and ffmpeg (test fixtures only)
         run: |
@@ -26,24 +51,17 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      # .cargo/config.toml unconditionally requires both (rustc-wrapper for
-      # every cargo invocation, wild as the x86_64-unknown-linux-gnu linker)
-      # - without these installed here, the very first `cargo build` below
-      # fails immediately (`could not execute process 'sccache ...'`).
+      # .cargo/config.toml's `build.rustc-wrapper = "sccache"` applies
+      # unconditionally - without sccache installed here, the very first
+      # `cargo build` below fails immediately (`could not execute process
+      # 'sccache ...'`). (The same file's `wild` linker for this target is
+      # overridden back to `cc` above - dev-machine-only, see this job's env.)
       # `SCCACHE_GHA_ENABLED` (job-level, so every cargo step below benefits,
       # not just the build one) points sccache at the GitHub Actions cache
       # backend instead of an ephemeral runner's local disk, which would
       # otherwise never persist anything across runs.
       - uses: mozilla-actions/sccache-action@v0.0.11
       - run: echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-
-      # Run from outside the checkout: .cargo/config.toml's rustflags for
-      # this target already require `-fuse-ld=wild`, and cargo discovers
-      # that config from the current directory upward - building wild
-      # itself from inside the repo would try to link wild with wild,
-      # which doesn't exist yet.
-      - name: Install wild (fast linker used for the Linux target)
-        run: cd /tmp && cargo install --locked wild-linker
 
       - name: Build (single wavefold binary — gui/encode subcommands)
         run: cargo build --release
