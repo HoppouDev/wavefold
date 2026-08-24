@@ -57,8 +57,15 @@ impl App {
             // from (e.g. a stray file-dialog result after leaving Setup).
             _ => Task::none(),
         };
+        // `snapshot()` clones the whole screen's state (including
+        // `encoding::State`'s unbounded log) - skip building one at all
+        // when no automation client is even connected to read it, instead
+        // of paying that cost on every single message (real UI or
+        // pipeline progress) for the entire life of the app.
         #[cfg(feature = "automation")]
-        self.automation.publish(self.screen.snapshot());
+        if self.automation.has_subscribers() {
+            self.automation.publish(self.screen.snapshot());
+        }
         task
     }
 
