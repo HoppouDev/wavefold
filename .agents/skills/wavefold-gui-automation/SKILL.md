@@ -72,6 +72,14 @@ first if unsure — the response's `"screen"` field tells you). A unit
 variant (no data) is just its bare name as a string, e.g. `"Start"`, so the
 full injected message is `{"Setup": "Start"}`.
 
+Sending a message for the *wrong* screen (e.g. injecting `{"Setup": ...}`
+while `"screen"` is actually `"encoding"`) is silently dropped, same as a
+real stray message would be — the response for that request takes the
+full 5s round-trip timeout instead of returning instantly, and comes back
+showing the genuinely-unchanged state. A slow response is your signal that
+your screen assumption was wrong; always check `snapshot` first rather than
+assuming.
+
 **Setup screen** (`src/ui/setup.rs`):
 
 | Message | Shape | Notes |

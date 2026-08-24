@@ -36,34 +36,53 @@ impl Default for App {
 
 impl App {
     pub fn update(&mut self, message: Message) -> Task<Message> {
-        let task = match (&mut self.screen, message) {
-            (Screen::Setup(state), Message::Setup(msg)) => match state.update(msg) {
-                setup::Action::None => Task::none(),
-                setup::Action::Run(task) => task.map(Message::Setup),
-                setup::Action::Start { input, output, cutoff, encoder, backend, dct_algorithm } => {
-                    let (encoding_state, task) = encoding::State::start(input, output, cutoff, encoder, backend, dct_algorithm);
-                    self.screen = Screen::Encoding(encoding_state);
-                    task.map(Message::Encoding)
-                }
-            },
-            (Screen::Encoding(state), Message::Encoding(msg)) => match state.update(msg) {
-                encoding::Action::None => Task::none(),
-                encoding::Action::BackToSetup => {
-                    self.screen = Screen::Setup(setup::State::default());
-                    Task::none()
-                }
-            },
+        let (task, dispatched) = match (&mut self.screen, message) {
+            (Screen::Setup(state), Message::Setup(msg)) => (
+                match state.update(msg) {
+                    setup::Action::None => Task::none(),
+                    setup::Action::Run(task) => task.map(Message::Setup),
+                    setup::Action::Start { input, output, cutoff, encoder, backend, dct_algorithm } => {
+                        let (encoding_state, task) = encoding::State::start(input, output, cutoff, encoder, backend, dct_algorithm);
+                        self.screen = Screen::Encoding(encoding_state);
+                        task.map(Message::Encoding)
+                    }
+                },
+                true,
+            ),
+            (Screen::Encoding(state), Message::Encoding(msg)) => (
+                match state.update(msg) {
+                    encoding::Action::None => Task::none(),
+                    encoding::Action::BackToSetup => {
+                        self.screen = Screen::Setup(setup::State::default());
+                        Task::none()
+                    }
+                },
+                true,
+            ),
             // A message meant for the screen we've since navigated away
-            // from (e.g. a stray file-dialog result after leaving Setup).
-            _ => Task::none(),
+            // from (e.g. a stray file-dialog result after leaving Setup) -
+            // not dispatched anywhere, so nothing about `self.screen`
+            // actually changed.
+            _ => (Task::none(), false),
         };
+
         // `snapshot()` clones the whole screen's state (including
         // `encoding::State`'s unbounded log) - skip building one at all
         // when no automation client is even connected to read it, instead
         // of paying that cost on every single message (real UI or
-        // pipeline progress) for the entire life of the app.
+        // pipeline progress) for the entire life of the app. Also skip it
+        // for a message that wasn't actually dispatched: publishing
+        // unconditionally here would let an automation client that injects
+        // a message for the wrong screen (e.g. a stale assumption about
+        // which screen is active) get back a fast, normal-looking
+        // response indistinguishable from a message that really was
+        // applied - better to let it wait out `wavefold_automation.py`'s
+        // timeout and see the genuinely-unchanged snapshot than lie to it
+        // quickly.
+        #[cfg(not(feature = "automation"))]
+        let _ = dispatched;
         #[cfg(feature = "automation")]
-        if self.automation.has_subscribers() {
+        if dispatched && self.automation.has_subscribers() {
             self.automation.publish(self.screen.snapshot());
         }
         task
