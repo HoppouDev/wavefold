@@ -23,9 +23,14 @@ serde_json = { version = "1", optional = true }
 # GUI test-automation IPC server (src/ui/automation.rs) - a localhost TCP
 # JSON-line protocol that injects real `ui::Message`s and reads back state,
 # so tests/AI agents can drive the app deterministically instead of OS-level
-# screenshot+input-injection (which is platform-specific, fragile against
-# window-manager focus/DPI quirks, and was the whole reason this exists -
-# see the git history around this feature). Off by default: it's a
+# screenshot+input-injection. That was tried first and hit real,
+# platform-specific problems: this app is a native Wayland surface
+# invisible to X11 tools like xdotool, KDE's focus-stealing prevention
+# meant "capture the active window" screenshots sometimes grabbed the
+# wrong window entirely, and ydotool's absolute-positioning mode needed a
+# touch-capable virtual input device this system's daemon couldn't create.
+# None of that is fixable from wavefold's side; driving the app's own
+# message loop directly sidesteps all of it. Off by default: it's a
 # localhost command port that can inject arbitrary UI actions, not
 # something a normal release build should carry.
 [features]
