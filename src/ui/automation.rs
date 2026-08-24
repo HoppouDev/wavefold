@@ -125,8 +125,19 @@ pub fn subscription(handle: &Handle) -> iced::Subscription<Message> {
             };
             info!("automation: listening on 127.0.0.1:{PORT}");
             loop {
-                let Ok((stream, _)) = listener.accept().await else { continue };
-                tokio::spawn(handle_client(stream, handle.clone(), output.clone()));
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        tokio::spawn(handle_client(stream, handle.clone(), output.clone()));
+                    }
+                    Err(e) => {
+                        // A transient OS-level error (e.g. EMFILE) would
+                        // otherwise spin this loop with no delay and no
+                        // diagnostic - log it and back off briefly instead
+                        // of silently burning a core.
+                        error!("automation: accept() failed: {e}");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
             }
         })
     })
