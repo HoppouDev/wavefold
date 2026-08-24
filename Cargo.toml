@@ -14,7 +14,7 @@ rfd = "0.17"
 rayon = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tokio = { version = "1", features = ["sync", "net", "io-util", "time"] }
+tokio = { version = "1", features = ["sync"] }
 tokio-stream = "0.1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 serde = { version = "1", features = ["derive"], optional = true }
@@ -29,7 +29,11 @@ serde_json = { version = "1", optional = true }
 # localhost command port that can inject arbitrary UI actions, not
 # something a normal release build should carry.
 [features]
-automation = ["dep:serde", "dep:serde_json"]
+# tokio's net/io-util/time are only used by src/ui/automation.rs - gated
+# here rather than on the base `tokio` dependency line so a default build
+# doesn't link networking/IO-driver machinery it never uses, matching the
+# "off by default" intent above.
+automation = ["dep:serde", "dep:serde_json", "tokio/net", "tokio/io-util", "tokio/time"]
 
 # Media I/O backend: GStreamer everywhere except Windows (no system package
 # manager there to provide it - see backends/media_foundation.rs), Media
