@@ -1,0 +1,20 @@
+{
+  "name": "wavefold",
+  "version": "0.1.0",
+  "description": "",
+  "scripts": {},
+  "keywords": [],
+  "author": "Hoppou",
+  "license": "GPL-3.0-only",
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "^11.3.0",
+      "onFail": "download"
+    }
+  },
+  "type": "module",
+  "dependencies": {
+    "d3": "^7.9.0"
+  }
+}

@@ -1,3 +1,8 @@
+# Rust
 /target
 /Cargo.lock
-SPEC.md
+
+# js/ts dev
+/.pnpm-debug.log*
+/pnpm-lock.yaml
+/node_modules/
