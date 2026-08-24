@@ -14,9 +14,22 @@ rfd = "0.17"
 rayon = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "net", "io-util", "time"] }
 tokio-stream = "0.1"
 image = { version = "0.25", default-features = false, features = ["png"] }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
+# GUI test-automation IPC server (src/ui/automation.rs) - a localhost TCP
+# JSON-line protocol that injects real `ui::Message`s and reads back state,
+# so tests/AI agents can drive the app deterministically instead of OS-level
+# screenshot+input-injection (which is platform-specific, fragile against
+# window-manager focus/DPI quirks, and was the whole reason this exists -
+# see the git history around this feature). Off by default: it's a
+# localhost command port that can inject arbitrary UI actions, not
+# something a normal release build should carry.
+[features]
+automation = ["dep:serde", "dep:serde_json"]
 
 # Media I/O backend: GStreamer everywhere except Windows (no system package
 # manager there to provide it - see backends/media_foundation.rs), Media

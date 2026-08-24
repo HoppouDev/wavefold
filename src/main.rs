@@ -102,14 +102,16 @@ fn main() {
 }
 
 fn run_gui() -> iced::Result {
-    iced::application(ui::App::default, ui::App::update, ui::App::view)
+    let app = iced::application(ui::App::default, ui::App::update, ui::App::view)
         .title("Wavefold")
         .window(iced::window::Settings {
             size: (640.0, 640.0).into(),
             icon: Some(load_icon()),
             ..Default::default()
-        })
-        .run()
+        });
+    #[cfg(feature = "automation")]
+    let app = app.subscription(ui::App::subscription);
+    app.run()
 }
 
 fn load_icon() -> iced::window::Icon {

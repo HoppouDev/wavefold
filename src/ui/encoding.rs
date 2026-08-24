@@ -15,6 +15,7 @@ pub struct State {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "automation", derive(serde::Serialize, serde::Deserialize))]
 pub enum Message {
     Pipeline(PipelineMsg),
     WorkerDone,
@@ -26,7 +27,27 @@ pub enum Action {
     BackToSetup,
 }
 
+/// See `setup::Snapshot`'s doc comment - same purpose, this screen's fields.
+#[cfg(feature = "automation")]
+#[derive(Clone, serde::Serialize)]
+pub struct Snapshot {
+    pub progress_current: u64,
+    pub progress_total: u64,
+    pub log: Vec<String>,
+    pub running: bool,
+}
+
 impl State {
+    #[cfg(feature = "automation")]
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            progress_current: self.progress_current,
+            progress_total: self.progress_total,
+            log: self.log.clone(),
+            running: self.running,
+        }
+    }
+
     /// Kicks off `pipeline::run` on a dedicated OS thread (it's a blocking
     /// call, not async) and returns a `Task` that streams its progress
     /// channel back reactively instead of the page polling every frame.

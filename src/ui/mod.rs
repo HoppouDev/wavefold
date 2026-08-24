@@ -1,3 +1,5 @@
+#[cfg(feature = "automation")]
+pub mod automation;
 pub mod encoding;
 pub mod setup;
 
@@ -5,6 +7,8 @@ use iced::{Element, Task};
 
 pub struct App {
     screen: Screen,
+    #[cfg(feature = "automation")]
+    automation: automation::Handle,
 }
 
 enum Screen {
@@ -13,6 +17,7 @@ enum Screen {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "automation", derive(serde::Serialize, serde::Deserialize))]
 pub enum Message {
     Setup(setup::Message),
     Encoding(encoding::Message),
@@ -20,13 +25,18 @@ pub enum Message {
 
 impl Default for App {
     fn default() -> Self {
-        Self { screen: Screen::Setup(setup::State::default()) }
+        let screen = Screen::Setup(setup::State::default());
+        Self {
+            #[cfg(feature = "automation")]
+            automation: automation::Handle::new(screen.snapshot()),
+            screen,
+        }
     }
 }
 
 impl App {
     pub fn update(&mut self, message: Message) -> Task<Message> {
-        match (&mut self.screen, message) {
+        let task = match (&mut self.screen, message) {
             (Screen::Setup(state), Message::Setup(msg)) => match state.update(msg) {
                 setup::Action::None => Task::none(),
                 setup::Action::Run(task) => task.map(Message::Setup),
@@ -46,13 +56,31 @@ impl App {
             // A message meant for the screen we've since navigated away
             // from (e.g. a stray file-dialog result after leaving Setup).
             _ => Task::none(),
-        }
+        };
+        #[cfg(feature = "automation")]
+        self.automation.publish(self.screen.snapshot());
+        task
     }
 
     pub fn view(&self) -> Element<'_, Message> {
         match &self.screen {
             Screen::Setup(state) => state.view().map(Message::Setup),
             Screen::Encoding(state) => state.view().map(Message::Encoding),
+        }
+    }
+
+    #[cfg(feature = "automation")]
+    pub fn subscription(&self) -> iced::Subscription<Message> {
+        automation::subscription(&self.automation)
+    }
+}
+
+#[cfg(feature = "automation")]
+impl Screen {
+    fn snapshot(&self) -> automation::Snapshot {
+        match self {
+            Screen::Setup(state) => automation::Snapshot::Setup(state.snapshot()),
+            Screen::Encoding(state) => automation::Snapshot::Encoding(state.snapshot()),
         }
     }
 }

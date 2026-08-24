@@ -28,6 +28,7 @@ pub trait DctBackend: Send {
 /// pipeline run on a GPU-less machine, e.g. a standard GitHub Actions
 /// runner).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[cfg_attr(feature = "automation", derive(serde::Serialize, serde::Deserialize))]
 pub enum ComputeBackend {
     Gpu,
     Cpu,
@@ -72,6 +73,7 @@ impl std::fmt::Display for ComputeBackend {
 /// `MediaBackendChoice` variant today has no picker at all versus this
 /// having one that simply doesn't apply sometimes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[cfg_attr(feature = "automation", derive(serde::Serialize, serde::Deserialize))]
 pub enum DctAlgorithm {
     Fft,
     Matmul,

@@ -6,6 +6,7 @@ use std::path::Path;
 use tokio::sync::mpsc::UnboundedSender as Sender;
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "automation", derive(serde::Serialize, serde::Deserialize))]
 pub enum PipelineMsg {
     Progress { current: u64, total: u64 },
     Log(String),

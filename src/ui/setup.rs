@@ -20,6 +20,7 @@ impl Default for State {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "automation", derive(serde::Serialize, serde::Deserialize))]
 pub enum Message {
     PickInput,
     InputPicked(Option<PathBuf>),
@@ -42,7 +43,35 @@ pub enum Action {
     Start { input: PathBuf, output: PathBuf, cutoff: f32, encoder: Codec, backend: ComputeBackend, dct_algorithm: DctAlgorithm },
 }
 
+/// What the automation IPC server (`ui::automation`) hands back after
+/// applying a command - a plain, serializable mirror of the fields
+/// `State` actually holds, kept separate from `State` itself so the real
+/// UI state never has to carry a `serde` bound outside `cfg(feature =
+/// "automation")`.
+#[cfg(feature = "automation")]
+#[derive(Clone, serde::Serialize)]
+pub struct Snapshot {
+    pub input: Option<PathBuf>,
+    pub output: Option<PathBuf>,
+    pub cutoff: f32,
+    pub encoder: Codec,
+    pub backend: ComputeBackend,
+    pub dct_algorithm: DctAlgorithm,
+}
+
 impl State {
+    #[cfg(feature = "automation")]
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            input: self.input.clone(),
+            output: self.output.clone(),
+            cutoff: self.cutoff,
+            encoder: self.encoder,
+            backend: self.backend,
+            dct_algorithm: self.dct_algorithm,
+        }
+    }
+
     pub fn update(&mut self, message: Message) -> Action {
         match message {
             Message::PickInput => Action::Run(Task::perform(pick_input_file(), Message::InputPicked)),

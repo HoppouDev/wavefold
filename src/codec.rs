@@ -6,6 +6,7 @@ use std::fmt;
 /// GStreamer element name; the Media Foundation backend maps it onto an
 /// `MFVideoFormat_*` subtype).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[cfg_attr(feature = "automation", derive(serde::Serialize, serde::Deserialize))]
 pub enum Codec {
     H264,
     H264Hardware,
