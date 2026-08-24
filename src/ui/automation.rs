@@ -24,12 +24,11 @@ use iced::futures::channel::mpsc;
 use iced::futures::SinkExt;
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Notify;
+use tokio::sync::watch;
 use tracing::{debug, error, info};
 
 pub const PORT: u16 = 47624;
@@ -49,20 +48,23 @@ pub enum Snapshot {
     Encoding(super::encoding::Snapshot),
 }
 
-struct Inner {
-    snapshot: Mutex<Snapshot>,
-    generation: AtomicU64,
-    notify: Notify,
-}
-
 /// Held by `App` (published to after every `update`, real or injected) and
 /// cloned into the subscription's worker (read from, to answer clients).
-/// `Hash`/`Eq` are by pointer identity, not contents - `App::subscription`
-/// hands the *same* `Handle` back on every call, and iced uses this to
-/// recognize the automation server as the same still-running subscription
-/// instead of tearing it down and rebinding the port every frame.
+///
+/// Backed by `tokio::sync::watch` rather than a hand-rolled `Mutex` +
+/// generation counter + `Notify`: an earlier version used exactly that
+/// combination, and it had a real missed-wakeup race - `Notify::notified()`
+/// only catches a `notify_waiters()` call made *after* the `Notified`
+/// future is created, but the old code created it *after* checking the
+/// counter, leaving a window where a `publish()` landing between the check
+/// and the `notified()` call would go unseen until the next unrelated
+/// update or a 5s timeout (confirmed against `tokio`'s own docs/source, not
+/// just suspected). `watch::Receiver::changed()` doesn't have that gap - it
+/// compares against an internally-tracked version under the same lock the
+/// sender updates, so there's no separate "register interest" step to lose
+/// a race with.
 #[derive(Clone)]
-pub struct Handle(Arc<Inner>);
+pub struct Handle(Arc<watch::Sender<Snapshot>>);
 
 impl PartialEq for Handle {
     fn eq(&self, other: &Self) -> bool {
@@ -79,34 +81,22 @@ impl Hash for Handle {
 
 impl Handle {
     pub fn new(initial: Snapshot) -> Self {
-        Self(Arc::new(Inner { snapshot: Mutex::new(initial), generation: AtomicU64::new(0), notify: Notify::new() }))
+        Self(Arc::new(watch::channel(initial).0))
     }
 
+    /// `send` only errors when every receiver has been dropped (no
+    /// automation client currently connected), which is fine to ignore -
+    /// the new value is still stored and the next client to `subscribe`
+    /// sees it.
     pub fn publish(&self, snapshot: Snapshot) {
-        *self.0.snapshot.lock().expect("automation snapshot mutex poisoned") = snapshot;
-        self.0.generation.fetch_add(1, Ordering::SeqCst);
-        self.0.notify.notify_waiters();
+        let _ = self.0.send(snapshot);
     }
 
-    fn snapshot(&self) -> Snapshot {
-        self.0.snapshot.lock().expect("automation snapshot mutex poisoned").clone()
-    }
-
-    fn generation(&self) -> u64 {
-        self.0.generation.load(Ordering::SeqCst)
-    }
-
-    /// Waits until `generation()` has moved past `before`, or `timeout`
-    /// elapses - `Notify` can miss a wakeup that fires between checking the
-    /// counter and starting to wait, so this loops rather than awaiting
-    /// `notified()` exactly once.
-    async fn wait_for_generation_past(&self, before: u64, timeout: Duration) {
-        let wait = async {
-            while self.generation() == before {
-                self.0.notify.notified().await;
-            }
-        };
-        let _ = tokio::time::timeout(timeout, wait).await;
+    /// Whether any automation client is currently connected - lets
+    /// `App::update` skip building a `Snapshot` at all (see its own doc
+    /// comment) when nothing would ever read it.
+    pub fn has_subscribers(&self) -> bool {
+        self.0.receiver_count() > 0
     }
 }
 
@@ -131,6 +121,7 @@ pub fn subscription(handle: &Handle) -> iced::Subscription<Message> {
 }
 
 async fn handle_client(stream: TcpStream, handle: Handle, mut output: mpsc::Sender<Message>) {
+    let mut state = handle.0.subscribe();
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
 
@@ -146,16 +137,15 @@ async fn handle_client(stream: TcpStream, handle: Handle, mut output: mpsc::Send
         };
 
         let response = match serde_json::from_str::<Request>(&line) {
-            Ok(Request::Snapshot) => serde_json::to_string(&handle.snapshot()),
+            Ok(Request::Snapshot) => serde_json::to_string(&*state.borrow_and_update()),
             Ok(Request::Inject(message)) => {
-                let before = handle.generation();
                 if output.send(message).await.is_err() {
                     // The stream side is gone (app shutting down) - nothing
                     // left to respond to a client about.
                     return;
                 }
-                handle.wait_for_generation_past(before, Duration::from_secs(5)).await;
-                serde_json::to_string(&handle.snapshot())
+                let _ = tokio::time::timeout(Duration::from_secs(5), state.changed()).await;
+                serde_json::to_string(&*state.borrow_and_update())
             }
             Err(e) => serde_json::to_string(&serde_json::json!({ "error": e.to_string() })),
         };
