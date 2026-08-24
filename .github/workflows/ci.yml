@@ -32,12 +32,18 @@ jobs:
     # 1.0, so plain Ubuntu-packaged GStreamer just works — see CLAUDE.md's
     # "What this is" section for why that's specifically what changed.
     # `wild` (.cargo/config.toml's linker for this target) is a dev-machine
-    # speed optimization only, not installed here — the env vars below
-    # override the linker back to plain `cc` with no extra rustflags for
-    # this job, so CI never needs to build/install wild at all.
+    # speed optimization only, not installed here. Overriding just the
+    # target-specific rustflags env var doesn't work — cargo still adds
+    # .cargo/config.toml's `--ld-path=wild` on top (confirmed in CI: `cc`
+    # then rejects it, "unrecognized command-line option '--ld-path=wild'"
+    # — the two `target.<triple>.rustflags` sources don't override, they
+    # merge). Plain `RUSTFLAGS` is checked first and replaces every
+    # config-derived rustflags entirely, so it's the one that actually
+    # drops `--ld-path=wild`. `CARGO_TARGET_..._LINKER` does override
+    # cleanly (confirmed), so that one stays as a targeted env var.
     env:
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ""
+      RUSTFLAGS: ""
     steps:
       - name: Install GStreamer dev headers, plugins, and ffmpeg (test fixtures only)
         run: |
