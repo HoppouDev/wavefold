@@ -23,6 +23,40 @@ pub enum Message {
     Encoding(encoding::Message),
 }
 
+/// The type iced actually operates on for `update`/`view`/`subscription` -
+/// `Message` plus an optional automation correlation id, so `App::update`
+/// can tell *which* message it's processing instead of only knowing *that*
+/// some message arrived. Real messages (widget events, `Task` results) are
+/// always `correlation_id: None` via `From<Message>`; only
+/// `automation::handle_client` constructs one with `Some(id)`, for exactly
+/// as long as it takes to correlate one injected message with the publish
+/// it caused (see `automation.rs`'s module doc for why this exists - a
+/// shared "did *something* change" signal isn't enough once other message
+/// sources, like an active encode's own progress events, can interleave).
+#[derive(Debug, Clone)]
+pub struct Envelope {
+    #[cfg(feature = "automation")]
+    correlation_id: Option<u64>,
+    message: Message,
+}
+
+impl From<Message> for Envelope {
+    fn from(message: Message) -> Self {
+        Self {
+            #[cfg(feature = "automation")]
+            correlation_id: None,
+            message,
+        }
+    }
+}
+
+#[cfg(feature = "automation")]
+impl Envelope {
+    pub(crate) fn from_automation(correlation_id: u64, message: Message) -> Self {
+        Self { correlation_id: Some(correlation_id), message }
+    }
+}
+
 impl Default for App {
     fn default() -> Self {
         let screen = Screen::Setup(setup::State::default());
@@ -35,7 +69,9 @@ impl Default for App {
 }
 
 impl App {
-    pub fn update(&mut self, message: Message) -> Task<Message> {
+    pub fn update(&mut self, envelope: Envelope) -> Task<Envelope> {
+        let Envelope { #[cfg(feature = "automation")] correlation_id, message } = envelope;
+
         let (task, dispatched) = match (&mut self.screen, message) {
             (Screen::Setup(state), Message::Setup(msg)) => (
                 match state.update(msg) {
@@ -83,20 +119,20 @@ impl App {
         let _ = dispatched;
         #[cfg(feature = "automation")]
         if dispatched && self.automation.has_subscribers() {
-            self.automation.publish(self.screen.snapshot());
+            self.automation.publish(correlation_id, self.screen.snapshot());
         }
-        task
+        task.map(Envelope::from)
     }
 
-    pub fn view(&self) -> Element<'_, Message> {
+    pub fn view(&self) -> Element<'_, Envelope> {
         match &self.screen {
-            Screen::Setup(state) => state.view().map(Message::Setup),
-            Screen::Encoding(state) => state.view().map(Message::Encoding),
+            Screen::Setup(state) => state.view().map(Message::Setup).map(Envelope::from),
+            Screen::Encoding(state) => state.view().map(Message::Encoding).map(Envelope::from),
         }
     }
 
     #[cfg(feature = "automation")]
-    pub fn subscription(&self) -> iced::Subscription<Message> {
+    pub fn subscription(&self) -> iced::Subscription<Envelope> {
         automation::subscription(&self.automation)
     }
 }

@@ -30,17 +30,38 @@
 //! make - acceptable for a build nobody ships and that only runs when a
 //! developer deliberately launches it for testing, not something to carry
 //! into a build meant to run unattended or on a shared/multi-tenant host.
+//!
+//! **Every `inject` gets its own dedicated one-shot reply**, not a shared
+//! "latest state" slot: `Handle::begin_request` hands out a fresh
+//! correlation id paired with a `oneshot::Receiver`, and `Handle::publish`
+//! - called from `App::update` via [`super::Envelope`] carrying that id -
+//! delivers the resulting `Snapshot` straight to that specific receiver.
+//! An earlier version tried to do this with `tokio::sync::watch` alone
+//! (compare a correlation id embedded in the "current value" against the
+//! one a client was waiting for), which looked correct but wasn't: `watch`
+//! only ever holds the *latest* value, so a second, unrelated publish
+//! landing between "my id showed up" and "I finished reading the value"
+//! (a real window even with no explicit `.await` in between, since other
+//! clients' tasks run on other OS threads and can genuinely race in) could
+//! silently overwrite it first - confirmed empirically with a 4-client
+//! concurrent stress test that reliably produced cross-client
+//! contamination (client A reading client B's value) despite the
+//! correlation id check. A one-shot channel has no shared slot to race
+//! over: nothing but `App::update`'s one `send()` for this exact id can
+//! ever write to it.
 
-use super::Message;
+use super::{Envelope, Message};
 use iced::futures::channel::mpsc;
 use iced::futures::SinkExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tracing::{debug, error, info};
 
 pub const PORT: u16 = 47624;
@@ -60,23 +81,29 @@ pub enum Snapshot {
     Encoding(super::encoding::Snapshot),
 }
 
+struct Inner {
+    // Current state for passive `"snapshot"` reads and `receiver_count()`
+    // (see `has_subscribers`) - *not* used to correlate `inject` responses
+    // anymore (see module doc for why that didn't work).
+    state: watch::Sender<Snapshot>,
+    next_id: AtomicU64,
+    // One entry per in-flight `inject` request, removed either by
+    // `publish` (the normal path: the message was applied, the reply was
+    // sent) or by the requester itself on timeout (the message was never
+    // dispatched - see `App::update`'s `dispatched` check - so nothing
+    // will ever remove it otherwise, which would otherwise leak one entry
+    // per wrong-screen/dropped injection for the life of the process).
+    pending: Mutex<HashMap<u64, oneshot::Sender<Snapshot>>>,
+}
+
 /// Held by `App` (published to after every `update`, real or injected) and
 /// cloned into the subscription's worker (read from, to answer clients).
-///
-/// Backed by `tokio::sync::watch` rather than a hand-rolled `Mutex` +
-/// generation counter + `Notify`: an earlier version used exactly that
-/// combination, and it had a real missed-wakeup race - `Notify::notified()`
-/// only catches a `notify_waiters()` call made *after* the `Notified`
-/// future is created, but the old code created it *after* checking the
-/// counter, leaving a window where a `publish()` landing between the check
-/// and the `notified()` call would go unseen until the next unrelated
-/// update or a 5s timeout (confirmed against `tokio`'s own docs/source, not
-/// just suspected). `watch::Receiver::changed()` doesn't have that gap - it
-/// compares against an internally-tracked version under the same lock the
-/// sender updates, so there's no separate "register interest" step to lose
-/// a race with.
+/// `Hash`/`Eq` are by pointer identity, not contents - `App::subscription`
+/// hands the *same* `Handle` back on every call, and iced uses this to
+/// recognize the automation server as the same still-running subscription
+/// instead of tearing it down and rebinding the port every frame.
 #[derive(Clone)]
-pub struct Handle(Arc<watch::Sender<Snapshot>>);
+pub struct Handle(Arc<Inner>);
 
 impl PartialEq for Handle {
     fn eq(&self, other: &Self) -> bool {
@@ -93,29 +120,55 @@ impl Hash for Handle {
 
 impl Handle {
     pub fn new(initial: Snapshot) -> Self {
-        Self(Arc::new(watch::channel(initial).0))
+        let (state, _) = watch::channel(initial);
+        Self(Arc::new(Inner { state, next_id: AtomicU64::new(0), pending: Mutex::new(HashMap::new()) }))
     }
 
-    /// `send` only errors when every receiver has been dropped (no
-    /// automation client currently connected), which is fine to ignore -
-    /// the new value is still stored and the next client to `subscribe`
-    /// sees it.
-    pub fn publish(&self, snapshot: Snapshot) {
-        let _ = self.0.send(snapshot);
+    /// Always updates the broadcast "current state" (for passive `snapshot`
+    /// reads), and - if `correlation_id` names a still-pending request -
+    /// delivers this exact `Snapshot` to that request's one-shot receiver.
+    /// A request only stays pending until its reply is sent or its
+    /// requester gives up on timeout, so a stale/unknown id (already
+    /// replied to, or never registered) is simply not found and ignored.
+    pub fn publish(&self, correlation_id: Option<u64>, snapshot: Snapshot) {
+        if let Some(id) = correlation_id {
+            if let Some(tx) = self.0.pending.lock().expect("automation pending mutex poisoned").remove(&id) {
+                let _ = tx.send(snapshot.clone());
+            }
+        }
+        let _ = self.0.state.send(snapshot);
     }
 
     /// Whether any automation client is currently connected - lets
     /// `App::update` skip building a `Snapshot` at all (see its own doc
     /// comment) when nothing would ever read it.
     pub fn has_subscribers(&self) -> bool {
-        self.0.receiver_count() > 0
+        self.0.state.receiver_count() > 0
+    }
+
+    /// Registers a fresh correlation id together with the one-shot channel
+    /// `publish` will use to reply to it, once a message carrying this id
+    /// is actually applied.
+    fn begin_request(&self) -> (u64, oneshot::Receiver<Snapshot>) {
+        let id = self.0.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.0.pending.lock().expect("automation pending mutex poisoned").insert(id, tx);
+        (id, rx)
+    }
+
+    /// Cleans up a request's entry if it's still pending - called by the
+    /// requester itself after giving up (timeout), since a message that
+    /// was never dispatched (wrong screen, or the app never got to it)
+    /// means `publish` will never be called for this id to remove it.
+    fn cancel_request(&self, id: u64) {
+        self.0.pending.lock().expect("automation pending mutex poisoned").remove(&id);
     }
 }
 
-pub fn subscription(handle: &Handle) -> iced::Subscription<Message> {
+pub fn subscription(handle: &Handle) -> iced::Subscription<Envelope> {
     iced::Subscription::run_with(handle.clone(), |handle| {
         let handle = handle.clone();
-        iced::stream::channel(32, move |output: mpsc::Sender<Message>| async move {
+        iced::stream::channel(32, move |output: mpsc::Sender<Envelope>| async move {
             let listener = match TcpListener::bind(("127.0.0.1", PORT)).await {
                 Ok(listener) => listener,
                 Err(e) => {
@@ -143,8 +196,8 @@ pub fn subscription(handle: &Handle) -> iced::Subscription<Message> {
     })
 }
 
-async fn handle_client(stream: TcpStream, handle: Handle, mut output: mpsc::Sender<Message>) {
-    let mut state = handle.0.subscribe();
+async fn handle_client(stream: TcpStream, handle: Handle, mut output: mpsc::Sender<Envelope>) {
+    let mut state = handle.0.state.subscribe();
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
 
@@ -162,13 +215,24 @@ async fn handle_client(stream: TcpStream, handle: Handle, mut output: mpsc::Send
         let response = match serde_json::from_str::<Request>(&line) {
             Ok(Request::Snapshot) => serde_json::to_string(&*state.borrow_and_update()),
             Ok(Request::Inject(message)) => {
-                if output.send(message).await.is_err() {
+                let (id, rx) = handle.begin_request();
+                if output.send(Envelope::from_automation(id, message)).await.is_err() {
                     // The stream side is gone (app shutting down) - nothing
                     // left to respond to a client about.
+                    handle.cancel_request(id);
                     return;
                 }
-                let _ = tokio::time::timeout(Duration::from_secs(5), state.changed()).await;
-                serde_json::to_string(&*state.borrow_and_update())
+                match tokio::time::timeout(Duration::from_secs(5), rx).await {
+                    Ok(Ok(snapshot)) => serde_json::to_string(&snapshot),
+                    // Timed out (message never dispatched, or the app is
+                    // stuck) or the sender was dropped without replying -
+                    // clean up the registration and fall back to whatever
+                    // the current state happens to be.
+                    _ => {
+                        handle.cancel_request(id);
+                        serde_json::to_string(&*state.borrow_and_update())
+                    }
+                }
             }
             Err(e) => serde_json::to_string(&serde_json::json!({ "error": e.to_string() })),
         };
