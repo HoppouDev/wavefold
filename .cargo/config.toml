@@ -2,7 +2,16 @@
 linker = "lld-link.exe"
 
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-fuse-ld=wild"]
+# `-fuse-ld=wild` (GCC's own symbolic-name lookup) needs GCC 16.1+ - GitHub
+# Actions' ubuntu-latest runner ships an older GCC that only recognizes a
+# hardcoded allowlist (bfd/gold/lld/mold) and rejects "wild" outright
+# (confirmed in CI: "unrecognized command-line option '-fuse-ld=wild'").
+# Routing the final link through clang instead avoids that allowlist
+# entirely - `--ld-path=` resolves `wild` via PATH the same way regardless
+# of clang version, and clang is already a documented build dependency for
+# this project on every distro (see README.md).
+linker = "clang"
+rustflags = ["-C", "link-arg=--ld-path=wild"]
 
 [build]
 rustc-wrapper = "sccache"
