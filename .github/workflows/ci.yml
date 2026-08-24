@@ -26,6 +26,25 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      # .cargo/config.toml unconditionally requires both (rustc-wrapper for
+      # every cargo invocation, wild as the x86_64-unknown-linux-gnu linker)
+      # - without these installed here, the very first `cargo build` below
+      # fails immediately (`could not execute process 'sccache ...'`).
+      # `SCCACHE_GHA_ENABLED` (job-level, so every cargo step below benefits,
+      # not just the build one) points sccache at the GitHub Actions cache
+      # backend instead of an ephemeral runner's local disk, which would
+      # otherwise never persist anything across runs.
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - run: echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+
+      # Run from outside the checkout: .cargo/config.toml's rustflags for
+      # this target already require `-fuse-ld=wild`, and cargo discovers
+      # that config from the current directory upward - building wild
+      # itself from inside the repo would try to link wild with wild,
+      # which doesn't exist yet.
+      - name: Install wild (fast linker used for the Linux target)
+        run: cd /tmp && cargo install --locked wild-linker
+
       - name: Build (single wavefold binary — gui/encode subcommands)
         run: cargo build --release
 
