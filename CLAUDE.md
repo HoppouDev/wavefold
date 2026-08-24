@@ -192,7 +192,13 @@ same basis math `dct_math.rs` → (GPU only) `shader.wgsl`.
     top-level `Screen` directly — only `App::update` does, based on
     `Action` it gets back. Stray messages for screen navigated away from
     (e.g. file-dialog result resolving after leaving Setup) silently
-    dropped in dispatch match.
+    dropped in dispatch match. Under the `automation` feature (see
+    `ui/automation.rs`), `update` also publishes a state snapshot to any
+    connected automation client after a message that was actually
+    dispatched to a screen — skipped both when no client is connected
+    (`Handle::has_subscribers()`) and for a dropped/stray message, so an
+    automation client can't mistake a silently-ignored injection for a
+    real one.
   - **`ui/setup.rs`** — input/output file pickers (`rfd::AsyncFileDialog`
     via `Task::perform`, not old synchronous `rfd::FileDialog`), cutoff
     slider, encoder `pick_list` (`Codec` implements `Display` in
