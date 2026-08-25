@@ -181,6 +181,53 @@ struct ComputedFrame {
     duration: Option<gst::ClockTime>,
 }
 
+/// One in-flight frame's dimensions+timing, stashed alongside a GPU frame
+/// pipeline slot between `submit_rgb` and its later `finish_rgb` — the DCT
+/// backend itself only holds pixel data, so this is what lets the compute
+/// thread rebuild a `ComputedFrame` once a slot's result comes back.
+struct FrameMeta {
+    width: u32,
+    height: u32,
+    pts: Option<gst::ClockTime>,
+    dts: Option<gst::ClockTime>,
+    duration: Option<gst::ClockTime>,
+}
+
+/// Finishes GPU (or CPU) work for `slot`, already populated by an earlier
+/// `submit_rgb`, builds a `ComputedFrame` from `meta`, and forwards it to
+/// `enc_tx`. Returns `false` if either the DCT backend failed (already
+/// reported onto `pipeline`'s bus, same as `submit_rgb`'s own failure path)
+/// or the encode thread's receiver is gone — either way the compute thread
+/// must stop.
+fn finish_slot(
+    dct: &dyn DctBackend,
+    slot: usize,
+    meta: FrameMeta,
+    enc_tx: &SyncSender<EncodeMsg>,
+    pipeline: &gst::Pipeline,
+) -> bool {
+    match dct.finish_rgb(slot) {
+        Ok((r, g, b)) => {
+            let out = ComputedFrame {
+                r,
+                g,
+                b,
+                width: meta.width,
+                height: meta.height,
+                pts: meta.pts,
+                dts: meta.dts,
+                duration: meta.duration,
+            };
+            enc_tx.send(EncodeMsg::Video(out)).is_ok()
+        }
+        Err(e) => {
+            error!("DCT backend failed: {e:#}");
+            pipeline.post_error_message(gst::error_msg!(gst::LibraryError::Failed, ["DCT backend failed: {e:#}"]));
+            false
+        }
+    }
+}
+
 /// `Eos` is an explicit message rather than relying on channel closure,
 /// since appsink's `new_preroll`/`new_sample` closures each hold their own
 /// clone of the decode-side sender for as long as the pipeline exists — the
@@ -415,37 +462,104 @@ fn run_inner(
     let compute_handle = thread::Builder::new()
         .name("wavefold-gst-compute".into())
         .spawn(move || {
+            // 2-deep GPU frame pipeline: submit_rgb for the frame landing in
+            // a slot happens BEFORE that slot is blocked on via finish_rgb,
+            // one frame apart - so the GPU's command queue never goes empty
+            // waiting on a CPU-side map_async round trip between frames, the
+            // stall still left over after splitting decode/compute/encode
+            // into their own threads alone (see docs/gstreamer-notes.md).
+            // `pending[slot]` holds whichever frame currently occupies that
+            // slot's GPU buffers, tagged with its submission order so EOS
+            // draining below can finish both slots back in the right order.
+            let mut pending: [Option<(u64, FrameMeta)>; 2] = [None, None];
+            let mut frame_counter: u64 = 0;
+
             for msg in dec_rx {
                 let frame = match msg {
                     DecodeMsg::Video(frame) => frame,
                     DecodeMsg::Eos => {
+                        // Drain whichever slots still hold a submitted-but-
+                        // unfinished frame, oldest submission first, so
+                        // frame order into enc_tx (and thus PTS/DTS order
+                        // into the encoder) stays correct regardless of
+                        // which slot each of the last two frames landed in.
+                        let mut order: Vec<usize> = (0..2).filter(|&s| pending[s].is_some()).collect();
+                        order.sort_by_key(|&s| pending[s].as_ref().expect("filtered above").0);
+                        for slot in order {
+                            let (_, meta) = pending[slot].take().expect("filtered above");
+                            if !finish_slot(dct.as_ref(), slot, meta, &enc_tx, &compute_pipeline) {
+                                return;
+                            }
+                        }
                         let _ = enc_tx.send(EncodeMsg::Eos);
                         return;
                     }
                 };
-                match dct.process_rgb(&frame.r, &frame.g, &frame.b, frame.width, frame.height, cutoff) {
-                    Ok((r, g, b)) => {
-                        let out = ComputedFrame {
-                            r,
-                            g,
-                            b,
-                            width: frame.width,
-                            height: frame.height,
-                            pts: frame.pts,
-                            dts: frame.dts,
-                            duration: frame.duration,
-                        };
-                        if enc_tx.send(EncodeMsg::Video(out)).is_err() {
-                            return; // encode thread already gone (errored) - stop feeding it
-                        }
-                    }
-                    Err(e) => {
+
+                let slot = (frame_counter % 2) as usize;
+                let meta = FrameMeta { width: frame.width, height: frame.height, pts: frame.pts, dts: frame.dts, duration: frame.duration };
+
+                // The very first frame must flow all the way through to
+                // `enc_tx`/`appsrc` synchronously, not deferred - GStreamer's
+                // PAUSED->PLAYING transition needs every sink (including
+                // `filesink`, downstream of `appsrc`) to receive one preroll
+                // buffer before completing, but `appsink` (decode side) only
+                // delivers a *second* buffer once the pipeline actually
+                // reaches PLAYING. Deferring frame 0's completion until frame
+                // 2 arrives - this file's very first version of this
+                // pipelining did exactly that - deadlocks: frame 2 can never
+                // be decoded because PLAYING never completes because
+                // `filesink` never prerolls because frame 0 never reached it.
+                // Priming with one synchronous frame breaks that cycle; every
+                // frame from here on is genuinely pipelined since the
+                // preroll requirement is already satisfied.
+                if frame_counter == 0 {
+                    if let Err(e) = dct.submit_rgb(slot, &frame.r, &frame.g, &frame.b, frame.width, frame.height, cutoff) {
                         error!("DCT backend failed: {e:#}");
                         compute_pipeline.post_error_message(gst::error_msg!(gst::LibraryError::Failed, ["DCT backend failed: {e:#}"]));
                         return;
                     }
+                    if !finish_slot(dct.as_ref(), slot, meta, &enc_tx, &compute_pipeline) {
+                        return;
+                    }
+                    frame_counter += 1;
+                    continue;
+                }
+
+                // Slot already holds an earlier frame (true once every slot
+                // has been primed): finish and forward it first, so its
+                // staging buffer is fully unmapped before submit_rgb below
+                // reuses this slot's buffers - writing into a still-mapped
+                // buffer is a wgpu validation error, not silently wrong
+                // output.
+                if let Some((_, prev_meta)) = pending[slot].take() {
+                    if !finish_slot(dct.as_ref(), slot, prev_meta, &enc_tx, &compute_pipeline) {
+                        return;
+                    }
+                }
+
+                if let Err(e) = dct.submit_rgb(slot, &frame.r, &frame.g, &frame.b, frame.width, frame.height, cutoff) {
+                    error!("DCT backend failed: {e:#}");
+                    compute_pipeline.post_error_message(gst::error_msg!(gst::LibraryError::Failed, ["DCT backend failed: {e:#}"]));
+                    return;
+                }
+                pending[slot] = Some((frame_counter, meta));
+                frame_counter += 1;
+            }
+
+            // Defensive fallback: channel closed without an explicit Eos
+            // (shouldn't happen - run_inner always sends one, see the
+            // `dec_tx_eos` doc comment below - but drain rather than
+            // silently drop any still-pending frame if it ever does).
+            let mut order: Vec<usize> = (0..2).filter(|&s| pending[s].is_some()).collect();
+            order.sort_by_key(|&s| pending[s].as_ref().expect("filtered above").0);
+            for slot in order {
+                let (_, meta) = pending[slot].take().expect("filtered above");
+                if !finish_slot(dct.as_ref(), slot, meta, &enc_tx, &compute_pipeline) {
+                    return;
                 }
             }
+            let _ = enc_tx.send(EncodeMsg::Eos);
         })
         .expect("failed to spawn compute thread");
 

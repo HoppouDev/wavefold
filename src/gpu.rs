@@ -76,12 +76,17 @@ pub struct DctGpu {
     col_pipeline: wgpu::ComputePipeline,
     params_layout: wgpu::BindGroupLayout,
     io_layout: wgpu::BindGroupLayout,
-    // One independent buffer set per channel slot so `process_rgb` can
+    // 6 slots = 2 frame-pipeline slots x 3 channels each, indexed as
+    // `frame_slot*3 + channel`. Channel-level: `process_rgb`/`submit_rgb`
     // submit all 3 channels' work before blocking on any of them, instead
-    // of forcing a full stall-and-resume round trip per channel — slots
-    // must stay physically separate since each channel's GPU work is
-    // in flight concurrently.
-    buffers: [RefCell<Option<PlaneBuffers>>; 3],
+    // of a full stall-and-resume round trip per channel. Frame-level (the
+    // point of having 2 slots at all): `submit_rgb`/`finish_rgb` let
+    // `backends/gstreamer.rs`'s compute thread submit frame N+1's GPU work
+    // before blocking on frame N's readback, so the GPU's command queue
+    // never goes empty during a CPU-side `map_async` round trip between
+    // frames. Slots must stay physically separate in both dimensions since
+    // each slot's GPU work can be in flight concurrently with the other's.
+    buffers: [RefCell<Option<PlaneBuffers>>; 6],
 }
 
 impl DctGpu {
@@ -202,7 +207,7 @@ impl DctGpu {
             col_pipeline,
             params_layout,
             io_layout,
-            buffers: [RefCell::new(None), RefCell::new(None), RefCell::new(None)],
+            buffers: std::array::from_fn(|_| RefCell::new(None)),
         })
     }
 
@@ -249,6 +254,63 @@ impl DctGpu {
         let r_out = self.finish_read(0, rx0)?;
         let g_out = self.finish_read(1, rx1)?;
         let b_out = self.finish_read(2, rx2)?;
+        Ok((r_out, g_out, b_out))
+    }
+
+    /// Submits GPU work for one full RGB frame occupying `frame_slot` (0 or
+    /// 1) without blocking on completion — the frame-level analog of the
+    /// "submit all 3 channels before blocking on any of them" principle
+    /// documented above `process_rgb`/on the `buffers` field, just one
+    /// level up: two frame slots let `backends/gstreamer.rs`'s compute
+    /// thread submit frame N+1's GPU work before blocking on frame N's
+    /// readback (`finish_rgb`), so `queue`'s command stream never goes
+    /// empty waiting on a CPU-side `map_async` round trip between frames —
+    /// the decode/compute/encode three-thread split alone still left this
+    /// stall *inside* the compute stage (see docs/gstreamer-notes.md).
+    ///
+    /// Caller must fully drain `frame_slot`'s previous occupant via
+    /// `finish_rgb` before calling this again for the same slot — writing
+    /// new pixel data into a slot's buffers via `queue.write_buffer` while
+    /// its staging buffer is still mapped from a prior `finish_rgb` is a
+    /// wgpu validation error (confirmed against the wgpu version this repo
+    /// uses), not silently wrong output; `backends/gstreamer.rs`'s compute
+    /// thread relies on this ordering explicitly.
+    pub fn submit_rgb(
+        &self,
+        frame_slot: usize,
+        r: &[f32],
+        g: &[f32],
+        b: &[f32],
+        width: u32,
+        height: u32,
+        cutoff: f32,
+    ) -> Result<()> {
+        if frame_slot >= 2 {
+            bail!("submit_rgb: frame_slot must be 0 or 1 (got {frame_slot})");
+        }
+        let base = frame_slot * 3;
+        self.encode_plane(base, r, width, height, cutoff)?;
+        self.encode_plane(base + 1, g, width, height, cutoff)?;
+        self.encode_plane(base + 2, b, width, height, cutoff)?;
+        Ok(())
+    }
+
+    /// Blocks on and reads back `frame_slot`'s GPU work previously
+    /// submitted via `submit_rgb` — the frame-level analog of `process_rgb`'s
+    /// back half, still issuing all 3 channels' `map_async` requests before
+    /// blocking on any of them.
+    pub fn finish_rgb(&self, frame_slot: usize) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        if frame_slot >= 2 {
+            bail!("finish_rgb: frame_slot must be 0 or 1 (got {frame_slot})");
+        }
+        let base = frame_slot * 3;
+        let rx0 = self.begin_read(base)?;
+        let rx1 = self.begin_read(base + 1)?;
+        let rx2 = self.begin_read(base + 2)?;
+        self.poll_bounded()?;
+        let r_out = self.finish_read(base, rx0)?;
+        let g_out = self.finish_read(base + 1, rx1)?;
+        let b_out = self.finish_read(base + 2, rx2)?;
         Ok((r_out, g_out, b_out))
     }
 
@@ -606,6 +668,23 @@ impl DctBackend for DctGpu {
     ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
         DctGpu::process_rgb(self, r, g, b, width, height, cutoff)
     }
+
+    fn submit_rgb(
+        &self,
+        frame_slot: usize,
+        r: &[f32],
+        g: &[f32],
+        b: &[f32],
+        width: u32,
+        height: u32,
+        cutoff: f32,
+    ) -> Result<()> {
+        DctGpu::submit_rgb(self, frame_slot, r, g, b, width, height, cutoff)
+    }
+
+    fn finish_rgb(&self, frame_slot: usize) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        DctGpu::finish_rgb(self, frame_slot)
+    }
 }
 
 #[cfg(test)]
@@ -697,5 +776,41 @@ mod tests {
         assert!(gpu.process_plane(&[], 4, 0, 1.0).is_err());
         let wrong_len = vec![0f32; 3];
         assert!(gpu.process_plane(&wrong_len, 4, 4, 1.0).is_err());
+    }
+
+    #[test]
+    fn submit_finish_pipelining_matches_process_rgb() {
+        let Some(gpu) = skip_no_gpu() else { return };
+        let (w, h) = (18u32, 12u32);
+        let plane_a: Vec<f32> = (0..(w * h)).map(|i| ((i * 29 + 3) % 256) as f32).collect();
+        let plane_b: Vec<f32> = (0..(w * h)).map(|i| ((i * 61 + 5) % 256) as f32).collect();
+        let cutoff = 0.7;
+
+        // Reference: plain (non-pipelined) process_rgb, one frame at a time.
+        let expected_a = gpu.process_rgb(&plane_a, &plane_a, &plane_a, w, h, cutoff).unwrap();
+        let expected_b = gpu.process_rgb(&plane_b, &plane_b, &plane_b, w, h, cutoff).unwrap();
+
+        // Pipelined: submit BOTH frame slots before finishing either, to
+        // actually exercise the double-buffered overlap
+        // `backends/gstreamer.rs`'s compute thread relies on.
+        gpu.submit_rgb(0, &plane_a, &plane_a, &plane_a, w, h, cutoff).unwrap();
+        gpu.submit_rgb(1, &plane_b, &plane_b, &plane_b, w, h, cutoff).unwrap();
+        let got_a = gpu.finish_rgb(0).unwrap();
+        let got_b = gpu.finish_rgb(1).unwrap();
+
+        for (a, b) in expected_a.0.iter().zip(got_a.0.iter()) {
+            assert!((a - b).abs() < 1e-3, "slot0 mismatch vs plain process_rgb: {a} vs {b}");
+        }
+        for (a, b) in expected_b.0.iter().zip(got_b.0.iter()) {
+            assert!((a - b).abs() < 1e-3, "slot1 mismatch vs plain process_rgb: {a} vs {b}");
+        }
+
+        // Reuse slot 0 after fully finishing it — must not panic or hit a
+        // wgpu validation error from writing into a still-mapped buffer.
+        gpu.submit_rgb(0, &plane_b, &plane_b, &plane_b, w, h, cutoff).unwrap();
+        let got_a2 = gpu.finish_rgb(0).unwrap();
+        for (a, b) in expected_b.0.iter().zip(got_a2.0.iter()) {
+            assert!((a - b).abs() < 1e-3, "slot0 reuse mismatch: {a} vs {b}");
+        }
     }
 }

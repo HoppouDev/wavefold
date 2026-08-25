@@ -87,6 +87,39 @@ kept it unchanged again for same reason.
   `/sys/class/drm/card*/device/gpu_busy_percent`: ~9% before
   (single-callback), ~60% average (min 44, max 77) after, encoding
   1280x720 to AV1 hardware.
+  - **Follow-up: thread-splitting alone still left a stall *inside* the
+    compute stage.** `dct.process_rgb` is fully synchronous per frame
+    (submit -> `poll_bounded` blocks the compute thread on the fence ->
+    readback) before that same thread even starts preparing the *next*
+    frame's GPU dispatch - so between decode/compute/encode running as
+    overlapping stages, the GPU's own command queue still went empty on
+    every frame's CPU-side `map_async` round trip. Fixed with a 2-deep
+    frame pipeline: `DctBackend::submit_rgb`/`finish_rgb` (`DctGpu` uses 6
+    buffer slots = 2 frame slots x 3 channels, `frame_slot*3+channel`;
+    `DctCpu` just computes eagerly and stashes, no GPU queue to keep busy)
+    let the compute thread submit frame N+1's work before blocking on
+    frame N's readback. Ordering matters: a slot's prior occupant must be
+    fully `finish_rgb`'d - unmapping its staging buffer - before
+    `submit_rgb` reuses that slot's buffers for a new frame, or wgpu's
+    mapping validation rejects the write; EOS drains both slots in
+    original submission order (tracked via a monotonic frame counter
+    alongside each slot) so PTS/DTS order into the encoder stays intact.
+  - **Follow-up to the follow-up: naively deferring frame 0's completion
+    deadlocked the whole pipeline.** First cut of the 2-deep pipeline above
+    deferred *every* frame's `finish_rgb`, including frame 0's, until its
+    slot got reused two frames later - reproduced as a hang (all threads
+    idle) on `tests/integration.rs`'s `encodes_synthetic_clip_end_to_end`.
+    Cause: GStreamer's PAUSED->PLAYING transition needs every sink -
+    `filesink` (downstream of `appsrc`) included, not just `appsink` - to
+    receive one preroll buffer before completing; `appsink` only delivers a
+    *second* decoded buffer once the pipeline actually reaches PLAYING. With
+    frame 0's result held back waiting for frame 2, `filesink` never got its
+    preroll buffer, so PLAYING never completed, so frame 2 never got
+    decoded - circular. Fix: frame 0 is always submitted *and* finished
+    synchronously (one exception, tagged by `frame_counter == 0` in the
+    compute thread), priming both branches' preroll before any deferral
+    starts; every frame from 1 onward pipelines for real since PLAYING is
+    already reached by then.
 - **A plain `queue` element between `appsrc` and encoder was tried first
   and reverted** — this pipeline relies on `appsrc.push_buffer()`
   synchronously reflecting downstream encode/mux failures (see the

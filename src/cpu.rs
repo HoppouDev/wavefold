@@ -1,6 +1,6 @@
 use crate::dct_backend::DctBackend;
 use crate::dct_math::{dct_basis, transpose_square};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 use std::cell::RefCell;
 
@@ -24,6 +24,15 @@ struct Basis {
 /// GPU-less but not single-threaded.
 pub struct DctCpu {
     basis: RefCell<Option<Basis>>,
+    // Backs `submit_rgb`/`finish_rgb`'s trait-level pipelining contract:
+    // CPU has no separate submit/wait phase (no GPU queue to keep
+    // non-empty), so `submit_rgb` just computes eagerly and stashes the
+    // result here for `finish_rgb` to hand back — implementing both
+    // (rather than relying on `DctBackend`'s stateless defaults) keeps
+    // `backends/gstreamer.rs`'s compute thread backend-agnostic, calling
+    // `submit_rgb`/`finish_rgb` uniformly regardless of which
+    // `Box<dyn DctBackend>` it holds.
+    stash: RefCell<[Option<(Vec<f32>, Vec<f32>, Vec<f32>)>; 2]>,
 }
 
 impl Default for DctCpu {
@@ -34,7 +43,40 @@ impl Default for DctCpu {
 
 impl DctCpu {
     pub fn new() -> Self {
-        Self { basis: RefCell::new(None) }
+        Self { basis: RefCell::new(None), stash: RefCell::new([None, None]) }
+    }
+
+    /// See the `stash` field's doc comment: eagerly computes (CPU has
+    /// nothing to gain from deferring) and stashes the result for
+    /// `finish_rgb` to pick up.
+    pub fn submit_rgb(
+        &self,
+        frame_slot: usize,
+        r: &[f32],
+        g: &[f32],
+        b: &[f32],
+        width: u32,
+        height: u32,
+        cutoff: f32,
+    ) -> Result<()> {
+        if frame_slot >= 2 {
+            bail!("submit_rgb: frame_slot must be 0 or 1 (got {frame_slot})");
+        }
+        let result = self.process_rgb(r, g, b, width, height, cutoff)?;
+        self.stash.borrow_mut()[frame_slot] = Some(result);
+        Ok(())
+    }
+
+    /// Takes back the result `submit_rgb` stashed for `frame_slot`. Errors
+    /// if `submit_rgb` wasn't called first for that slot (or its result was
+    /// already taken by an earlier `finish_rgb`).
+    pub fn finish_rgb(&self, frame_slot: usize) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        if frame_slot >= 2 {
+            bail!("finish_rgb: frame_slot must be 0 or 1 (got {frame_slot})");
+        }
+        self.stash.borrow_mut()[frame_slot]
+            .take()
+            .context("finish_rgb: no result stashed for this frame_slot - submit_rgb must be called first")
     }
 
     pub fn process_rgb(
@@ -153,6 +195,23 @@ impl DctBackend for DctCpu {
         cutoff: f32,
     ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
         DctCpu::process_rgb(self, r, g, b, width, height, cutoff)
+    }
+
+    fn submit_rgb(
+        &self,
+        frame_slot: usize,
+        r: &[f32],
+        g: &[f32],
+        b: &[f32],
+        width: u32,
+        height: u32,
+        cutoff: f32,
+    ) -> Result<()> {
+        DctCpu::submit_rgb(self, frame_slot, r, g, b, width, height, cutoff)
+    }
+
+    fn finish_rgb(&self, frame_slot: usize) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        DctCpu::finish_rgb(self, frame_slot)
     }
 }
 
