@@ -2,7 +2,10 @@
   "name": "wavefold",
   "version": "0.1.0",
   "description": "",
-  "scripts": {},
+  "scripts": {
+    "logo": "node assets/icon.ts",
+    "typecheck": "tsc --noEmit"
+  },
   "keywords": [],
   "author": "Hoppou",
   "license": "GPL-3.0-only",
@@ -14,7 +17,15 @@
     }
   },
   "type": "module",
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "@types/opentype.js": "^1.3.10",
+    "typescript": "^7.0.2"
+  },
   "dependencies": {
-    "d3": "^7.9.0"
+    "@svgdotjs/svg.js": "^3.2.8",
+    "js-angusj-clipper": "^1.3.1",
+    "opentype.js": "^2.0.0",
+    "svgdom": "^0.1.28"
   }
 }
