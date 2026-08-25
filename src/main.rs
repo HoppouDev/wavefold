@@ -106,7 +106,8 @@ fn run_gui() -> iced::Result {
                 ..Default::default()
             },
             ..Default::default()
-        });
+        })
+        .theme(|_state: &ui::App| iced::Theme::CatppuccinMocha);
     #[cfg(feature = "automation")]
     let app = app.subscription(ui::App::subscription);
     app.run()
