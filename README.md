@@ -1,7 +1,7 @@
 <!-- prettier-ignore -->
 <div align="center">
 
-<img src="assets/generated/icon.svg" alt="" align="center" height="96" />
+<img src="docs/icon.svg" alt="" align="center" height="96" />
 
 # wavefold
 
