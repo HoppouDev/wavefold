@@ -3,7 +3,7 @@
 Deep pitfalls/war-stories behind `src/backends/media_foundation.rs` (only
 `MediaBackend` impl on Windows, `cfg(windows)`, built on
 `IMFSourceReader`/`IMFSinkWriter` instead of `gst::Pipeline`). Split out of
-`CLAUDE.md` to keep that file's per-session load light — pull this up only
+`AGENTS.md` to keep that file's per-session load light — pull this up only
 when actually touching this backend.
 
 Originally verified only by cross-compiling *whole* crate (GUI included)

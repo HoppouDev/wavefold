@@ -29,7 +29,7 @@ jobs:
     # device — this job is the proof the CLI's --backend cpu path works
     # without either. No container workaround needed here (unlike the old
     # ffmpeg-next-based pipeline): GStreamer's C ABI has been stable since
-    # 1.0, so plain Ubuntu-packaged GStreamer just works — see CLAUDE.md's
+    # 1.0, so plain Ubuntu-packaged GStreamer just works — see AGENTS.md's
     # "What this is" section for why that's specifically what changed.
     # `wild` (.cargo/config.toml's linker for this target) is a dev-machine
     # speed optimization only, not installed here. Overriding just the

@@ -174,7 +174,7 @@ Just Rust ([rustup-init](https://rustup.rs), MSVC toolchain) needed.
 > [!NOTE]
 > Windows Media Foundation has a few platform-specific gaps compared to the
 > GStreamer backend (a minimum input resolution, no software AV1 encoder,
-> MP4 audio limited to AAC) — see `CLAUDE.md` for specifics. None of these
+> MP4 audio limited to AAC) — see `AGENTS.md` for specifics. None of these
 > are wavefold bugs; they're limitations of Windows' own built-in codec
 > MFTs.
 
@@ -245,7 +245,7 @@ fails cleanly instead of muxing.
 
 ## Development
 
-`CLAUDE.md` documents the full architecture in depth — decode/encode
+`AGENTS.md` documents the full architecture in depth — decode/encode
 backends, the GPU DCT compute pipeline, and the reasoning behind the more
 subtle design decisions.
 

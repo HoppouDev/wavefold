@@ -1,7 +1,7 @@
 # `backends::gstreamer` implementation notes
 
 Deep pitfalls/war-stories behind `src/backends/gstreamer.rs`. Split out of
-`CLAUDE.md` to keep that file's per-session load light — pull this up only
+`AGENTS.md` to keep that file's per-session load light — pull this up only
 when actually touching `backends/gstreamer.rs`.
 
 `codec_profile(codec)` → private `EncoderProfile { element_factory_name,
