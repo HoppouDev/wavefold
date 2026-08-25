@@ -107,6 +107,10 @@ fn run_gui() -> iced::Result {
         .window(iced::window::Settings {
             size: (640.0, 640.0).into(),
             icon: Some(load_icon()),
+            platform_specific: iced::window::settings::PlatformSpecific {
+                application_id: "wavefold".to_string(),
+                ..Default::default()
+            },
             ..Default::default()
         });
     #[cfg(feature = "automation")]
