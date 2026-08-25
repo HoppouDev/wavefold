@@ -107,7 +107,19 @@ fn run_gui() -> iced::Result {
             },
             ..Default::default()
         })
-        .theme(|_state: &ui::App| iced::Theme::CatppuccinMocha);
+        .theme(|_state: &ui::App| {
+            iced::Theme::custom(
+                "Catppuccin Mocha (Mauve)".to_string(),
+                iced::theme::Palette {
+                    background: iced::Color::from_rgb8(0x1e, 0x1e, 0x2e),
+                    text: iced::Color::from_rgb8(0xcd, 0xd6, 0xf4),
+                    primary: iced::Color::from_rgb8(0xcb, 0xa6, 0xf7),
+                    success: iced::Color::from_rgb8(0xa6, 0xe3, 0xa1),
+                    warning: iced::Color::from_rgb8(0xf9, 0xe2, 0xaf),
+                    danger: iced::Color::from_rgb8(0xf3, 0x8b, 0xa8),
+                },
+            )
+        });
     #[cfg(feature = "automation")]
     let app = app.subscription(ui::App::subscription);
     app.run()
