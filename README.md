@@ -1,11 +1,11 @@
 <!-- prettier-ignore -->
 <div align="center">
 
-<img src="assets/icon.svg" alt="" align="center" height="96" />
+<img src="assets/generated/icon.svg" alt="" align="center" height="96" />
 
 # wavefold
 
-*Whole-frame DCT distortion for video — global ringing and ghosting, not blocky compression artifacts*
+_Whole-frame DCT distortion for video — global ringing and ghosting, not blocky compression artifacts_
 
 [![CI](https://img.shields.io/github/actions/workflow/status/HoppouDev/wavefold/ci.yml?style=flat-square&label=CI)](https://github.com/HoppouDev/wavefold/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/HoppouDev/wavefold?style=flat-square&include_prereleases)](https://github.com/HoppouDev/wavefold/releases)
@@ -51,7 +51,7 @@ The effect is a straight forward+inverse DCT-II per frame: forward-transform
 each color plane, zero out coefficients past a diagonal frequency cutoff,
 then inverse-transform back to pixels. A cutoff near `0.0` keeps only the DC
 coefficient (maximum distortion); `2.0` keeps the whole spectrum
-(near-lossless). Because the transform runs over the *entire* frame at once
+(near-lossless). Because the transform runs over the _entire_ frame at once
 rather than in small blocks, the coefficients that get dropped carry
 information shared across the whole image — losing them produces smeared,
 ghost-like artifacts rather than the tiled blockiness a block-based codec
@@ -202,12 +202,12 @@ wavefold encode <input> <output> [OPTIONS]   # headless, no display server neede
 
 `encode` options:
 
-| Flag | Default | Description |
-|---|---|---|
-| `--cutoff <F>` | `0.6` | DCT spectrum cutoff, `0.0`–`2.0`. `0` = DC only (max distortion), `2.0` = full spectrum (near-lossless). |
-| `--encoder <CODEC>` | `h264` | `h264`, `h265`, `vp9`, `av1`, or `-hardware` variants of each. |
-| `--backend <BACKEND>` | `gpu` | `gpu` or `cpu` compute backend for the DCT pass. |
-| `--dct-algorithm <ALGO>` | `fft` | `fft` (fast, GPU only) or `matmul` (original). Ignored under `--backend cpu`. |
+| Flag                     | Default | Description                                                                                              |
+| ------------------------ | ------- | -------------------------------------------------------------------------------------------------------- |
+| `--cutoff <F>`           | `0.6`   | DCT spectrum cutoff, `0.0`–`2.0`. `0` = DC only (max distortion), `2.0` = full spectrum (near-lossless). |
+| `--encoder <CODEC>`      | `h264`  | `h264`, `h265`, `vp9`, `av1`, or `-hardware` variants of each.                                           |
+| `--backend <BACKEND>`    | `gpu`   | `gpu` or `cpu` compute backend for the DCT pass.                                                         |
+| `--dct-algorithm <ALGO>` | `fft`   | `fft` (fast, GPU only) or `matmul` (original). Ignored under `--backend cpu`.                            |
 
 ```bash
 wavefold encode input.mp4 output.mp4 --cutoff 0.3 --encoder av1-hardware
@@ -217,12 +217,12 @@ wavefold encode input.mp4 output.mp4 --cutoff 0.3 --encoder av1-hardware
 
 ### GStreamer backend (Linux/macOS)
 
-| Codec | Software element | VAAPI hardware element | Notes |
-|---|---|---|---|
-| H.264 | `x264enc` | `vah264enc` | |
-| H.265/HEVC | `x265enc` | `vah265enc` | |
-| VP9 | `vp9enc` | — (not available) | No GPU ships VAAPI VP9 encode. Software VP9 must mux to `.mkv`, not `.mp4`. |
-| AV1 | `av1enc` | `vaav1enc` | |
+| Codec      | Software element | VAAPI hardware element | Notes                                                                       |
+| ---------- | ---------------- | ---------------------- | --------------------------------------------------------------------------- |
+| H.264      | `x264enc`        | `vah264enc`            |                                                                             |
+| H.265/HEVC | `x265enc`        | `vah265enc`            |                                                                             |
+| VP9        | `vp9enc`         | — (not available)      | No GPU ships VAAPI VP9 encode. Software VP9 must mux to `.mkv`, not `.mp4`. |
+| AV1        | `av1enc`         | `vaav1enc`             |                                                                             |
 
 ### Media Foundation backend (Windows)
 
@@ -231,12 +231,12 @@ requested codec — there's no fixed element name the way GStreamer has.
 `--encoder <codec>-hardware` allows (not forces) a hardware MFT; the plain
 variant forces software.
 
-| Codec | Notes |
-|---|---|
-| H.264 | |
-| H.265/HEVC | |
-| VP9 | Windows ships an MF *decoder* for VP9, not an encoder — same gap as the GStreamer backend's missing VAAPI VP9 encode. |
-| AV1 | Encoder availability depends on what's registered on the system (varies by Windows version/hardware). |
+| Codec      | Notes                                                                                                                 |
+| ---------- | --------------------------------------------------------------------------------------------------------------------- |
+| H.264      |                                                                                                                       |
+| H.265/HEVC |                                                                                                                       |
+| VP9        | Windows ships an MF _decoder_ for VP9, not an encoder — same gap as the GStreamer backend's missing VAAPI VP9 encode. |
+| AV1        | Encoder availability depends on what's registered on the system (varies by Windows version/hardware).                 |
 
 Output container is inferred from the file extension by Media Foundation's
 own byte-stream-handler resolution — reliably `.mp4`/`.mov`; unlike the
