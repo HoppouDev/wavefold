@@ -51,7 +51,7 @@ jobs:
           cp target/${{ matrix.target }}/release/wavefold "$stage/"
           cp -r packaging/linux "$stage/"
           mkdir -p "$stage/linux/icons/hicolor/scalable/apps"
-          cp assets/icon.svg "$stage/linux/icons/hicolor/scalable/apps/wavefold.svg"
+          cp docs/icon.svg "$stage/linux/icons/hicolor/scalable/apps/wavefold.svg"
           cp LICENSE.md README.md "$stage/"
           tar czf "$stage.tar.gz" "$stage"
 

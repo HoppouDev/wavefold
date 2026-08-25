@@ -181,12 +181,12 @@ Just Rust ([rustup-init](https://rustup.rs), MSVC toolchain) needed.
 ### Linux desktop shortcut
 
 A `.desktop` file is in [`packaging/linux`](packaging/linux); the app icon
-is [`assets/icon.svg`](assets/icon.svg):
+is [`docs/icon.svg`](docs/icon.svg):
 
 ```bash
 cp packaging/linux/wavefold.desktop ~/.local/share/applications/
 mkdir -p ~/.local/share/icons/hicolor/scalable/apps
-cp assets/icon.svg ~/.local/share/icons/hicolor/scalable/apps/wavefold.svg
+cp docs/icon.svg ~/.local/share/icons/hicolor/scalable/apps/wavefold.svg
 update-desktop-database ~/.local/share/applications 2>/dev/null
 gtk-update-icon-cache ~/.local/share/icons/hicolor 2>/dev/null
 ```

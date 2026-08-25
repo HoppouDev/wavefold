@@ -8,6 +8,15 @@ import { dirname } from "node:path";
 
 export type Point = readonly [x: number, y: number];
 
+// Shared by SvgRenderer.writeTo() and any script (e.g. genassets.ts) that
+// writes more than one output derived from a renderer — same
+// mkdir+write+log sequence either way, kept in one place.
+export function writeAsset(path: string, data: string | Buffer): void {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, data);
+  console.log(`wrote ${path}`);
+}
+
 // Clipper works in integers; this scales our sub-pixel float coordinates
 // up before offsetting and back down after, per the library's own
 // recommended pattern for preserving precision.
@@ -140,7 +149,6 @@ export abstract class SvgRenderer {
 
   async writeTo(path: string): Promise<void> {
     const svg = await this.render();
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, svg);
+    writeAsset(path, svg);
   }
 }
