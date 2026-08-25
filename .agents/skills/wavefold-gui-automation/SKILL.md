@@ -89,7 +89,6 @@ assuming.
 | Set cutoff | `{"Setup": {"CutoffChanged": 0.85}}` | `f32`, valid range `0.0..=2.0`. |
 | Set encoder | `{"Setup": {"EncoderSelected": "H265Hardware"}}` | One of `H264`, `H264Hardware`, `H265`, `H265Hardware`, `Vp9`, `Vp9Hardware`, `Av1`, `Av1Hardware`. |
 | Set compute backend | `{"Setup": {"BackendSelected": "Gpu"}}` | `"Gpu"` or `"Cpu"`. |
-| Set DCT algorithm | `{"Setup": {"DctAlgorithmSelected": "Fft"}}` | `"Fft"` or `"Matmul"`; GPU-only, harmlessly ignored under `Cpu`. |
 | Start the encode | `{"Setup": "Start"}` | No-ops if input or output isn't set yet (mirrors the real Start button being disabled) - check the response's `screen` to see whether it actually transitioned to `"encoding"`. |
 
 **Encoding screen** (`src/ui/encoding.rs`):
@@ -106,8 +105,7 @@ watching the window would see them.
 ## Snapshot fields
 
 **Setup**: `input` (nullable path string), `output` (nullable path string),
-`cutoff` (f32), `encoder`, `backend`, `dct_algorithm` (all as their string
-names above).
+`cutoff` (f32), `encoder`, `backend` (all as their string names above).
 
 **Encoding**: `progress_current`, `progress_total` (u64; total is `0` until
 known), `log` (array of strings, in order), `running` (bool).

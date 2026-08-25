@@ -1,5 +1,5 @@
 use wavefold::codec::Codec;
-use wavefold::dct_backend::{ComputeBackend, DctAlgorithm};
+use wavefold::dct_backend::ComputeBackend;
 use iced::widget::{button, column, pick_list, row, slider, text};
 use iced::{Element, Task};
 use std::path::PathBuf;
@@ -10,12 +10,11 @@ pub struct State {
     cutoff: f32,
     encoder: Codec,
     backend: ComputeBackend,
-    dct_algorithm: DctAlgorithm,
 }
 
 impl Default for State {
     fn default() -> Self {
-        Self { input: None, output: None, cutoff: 0.6, encoder: Codec::H264, backend: ComputeBackend::Gpu, dct_algorithm: DctAlgorithm::Fft }
+        Self { input: None, output: None, cutoff: 0.6, encoder: Codec::H264, backend: ComputeBackend::Gpu }
     }
 }
 
@@ -29,7 +28,6 @@ pub enum Message {
     CutoffChanged(f32),
     EncoderSelected(Codec),
     BackendSelected(ComputeBackend),
-    DctAlgorithmSelected(DctAlgorithm),
     Start,
 }
 
@@ -40,7 +38,7 @@ pub enum Message {
 pub enum Action {
     None,
     Run(Task<Message>),
-    Start { input: PathBuf, output: PathBuf, cutoff: f32, encoder: Codec, backend: ComputeBackend, dct_algorithm: DctAlgorithm },
+    Start { input: PathBuf, output: PathBuf, cutoff: f32, encoder: Codec, backend: ComputeBackend },
 }
 
 /// What the automation IPC server (`ui::automation`) hands back after
@@ -56,7 +54,6 @@ pub struct Snapshot {
     pub cutoff: f32,
     pub encoder: Codec,
     pub backend: ComputeBackend,
-    pub dct_algorithm: DctAlgorithm,
 }
 
 impl State {
@@ -68,7 +65,6 @@ impl State {
             cutoff: self.cutoff,
             encoder: self.encoder,
             backend: self.backend,
-            dct_algorithm: self.dct_algorithm,
         }
     }
 
@@ -100,15 +96,11 @@ impl State {
                 self.backend = backend;
                 Action::None
             }
-            Message::DctAlgorithmSelected(dct_algorithm) => {
-                self.dct_algorithm = dct_algorithm;
-                Action::None
-            }
             Message::Start => {
                 let (Some(input), Some(output)) = (self.input.clone(), self.output.clone()) else {
                     return Action::None;
                 };
-                Action::Start { input, output, cutoff: self.cutoff, encoder: self.encoder, backend: self.backend, dct_algorithm: self.dct_algorithm }
+                Action::Start { input, output, cutoff: self.cutoff, encoder: self.encoder, backend: self.backend }
             }
         }
     }
@@ -145,16 +137,6 @@ impl State {
         ]
         .spacing(10);
 
-        // Always shown, even under the CPU backend where it has no effect
-        // (no CPU FFT path exists) - matches this app's other pickers,
-        // which stay visible rather than appearing/disappearing based on
-        // other selections.
-        let dct_algorithm_row = row![
-            text("DCT algorithm (GPU only):"),
-            pick_list(DctAlgorithm::ALL, Some(self.dct_algorithm), Message::DctAlgorithmSelected),
-        ]
-        .spacing(10);
-
         let can_start = self.input.is_some() && self.output.is_some();
         let start_button = button("Encode").on_press_maybe(can_start.then_some(Message::Start));
 
@@ -166,7 +148,6 @@ impl State {
             cutoff_row,
             encoder_row,
             backend_row,
-            dct_algorithm_row,
             start_button,
         ]
         .spacing(12)

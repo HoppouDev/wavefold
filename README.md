@@ -5,8 +5,6 @@
 
 # wavefold
 
-_Whole-frame DCT distortion for video — global ringing and ghosting, not blocky compression artifacts_
-
 [![CI](https://img.shields.io/github/actions/workflow/status/HoppouDev/wavefold/ci.yml?style=flat-square&label=CI)](https://github.com/HoppouDev/wavefold/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/HoppouDev/wavefold?style=flat-square&include_prereleases)](https://github.com/HoppouDev/wavefold/releases)
 [![License: GPLv3](https://img.shields.io/badge/License-GPLv3-blue?style=flat-square)](LICENSE.md)
@@ -35,9 +33,8 @@ blockiness of JPEG or block-based video codecs.
 - **Whole-frame DCT** — the transform spans the entire frame, not 8×8
   blocks, so dropping high frequencies gives global ringing/ghosting instead
   of localized blockiness.
-- **GPU or CPU compute** — GPU via [wgpu](https://wgpu.rs) (with a fast
-  FFT-based DCT path alongside the original matrix-multiply one), or a
-  pure-Rust CPU fallback that needs no GPU at all.
+- **GPU or CPU compute** — GPU via [wgpu](https://wgpu.rs), or a pure-Rust
+  CPU fallback that needs no GPU at all.
 - **Software or hardware encoding** — x264/x265/vp9/av1, software or
   VAAPI/Media Foundation hardware, audio passed through untouched.
 - **Cross-platform, no bundled runtime** — GStreamer on Linux/macOS, Media
@@ -207,7 +204,6 @@ wavefold encode <input> <output> [OPTIONS]   # headless, no display server neede
 | `--cutoff <F>`           | `0.6`   | DCT spectrum cutoff, `0.0`–`2.0`. `0` = DC only (max distortion), `2.0` = full spectrum (near-lossless). |
 | `--encoder <CODEC>`      | `h264`  | `h264`, `h265`, `vp9`, `av1`, or `-hardware` variants of each.                                           |
 | `--backend <BACKEND>`    | `gpu`   | `gpu` or `cpu` compute backend for the DCT pass.                                                         |
-| `--dct-algorithm <ALGO>` | `fft`   | `fft` (fast, GPU only) or `matmul` (original). Ignored under `--backend cpu`.                            |
 
 ```bash
 wavefold encode input.mp4 output.mp4 --cutoff 0.3 --encoder av1-hardware

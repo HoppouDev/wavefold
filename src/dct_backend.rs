@@ -45,12 +45,11 @@ impl ComputeBackend {
     }
 
     /// Resolves the choice into a concrete backend. GPU construction can
-    /// fail (no compatible adapter); CPU construction never does. `algorithm`
-    /// only affects the `Gpu` branch (see `DctAlgorithm`'s doc comment).
-    pub fn build(&self, algorithm: DctAlgorithm) -> Result<Box<dyn DctBackend>> {
+    /// fail (no compatible adapter); CPU construction never does.
+    pub fn build(&self) -> Result<Box<dyn DctBackend>> {
         match self {
             ComputeBackend::Gpu => Ok(Box::new(
-                DctGpu::new(algorithm).map_err(|e| anyhow!("GPU init failed: {e:#}"))?,
+                DctGpu::new().map_err(|e| anyhow!("GPU init failed: {e:#}"))?,
             )),
             ComputeBackend::Cpu => Ok(Box::new(DctCpu::new())),
         }
@@ -58,39 +57,6 @@ impl ComputeBackend {
 }
 
 impl std::fmt::Display for ComputeBackend {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.label())
-    }
-}
-
-/// Which DCT algorithm `DctGpu` runs: the original O(N²)-per-axis tiled
-/// GEMM (`shader.wgsl`), or the O(N log N)-per-axis mixed-radix FFT
-/// (`shader_fft.wgsl`, `fft_plan.rs`) with automatic per-axis fallback to
-/// the GEMM path for any width/height that doesn't factor completely into
-/// {2,3,5,7} (e.g. a stray large prime like 541) or is odd. GPU-only —
-/// `ComputeBackend::Cpu` ignores this (no CPU FFT path), so the GUI's
-/// picker for it stays visible but inert under CPU, matching how a single
-/// `MediaBackendChoice` variant today has no picker at all versus this
-/// having one that simply doesn't apply sometimes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-#[cfg_attr(feature = "automation", derive(serde::Serialize, serde::Deserialize))]
-pub enum DctAlgorithm {
-    Fft,
-    Matmul,
-}
-
-impl DctAlgorithm {
-    pub const ALL: [DctAlgorithm; 2] = [DctAlgorithm::Fft, DctAlgorithm::Matmul];
-
-    pub fn label(&self) -> &'static str {
-        match self {
-            DctAlgorithm::Fft => "Faster (FFT-based, GPU only)",
-            DctAlgorithm::Matmul => "Original (matrix multiply)",
-        }
-    }
-}
-
-impl std::fmt::Display for DctAlgorithm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.label())
     }

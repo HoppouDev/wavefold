@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 use std::io::Write;
 use std::path::PathBuf;
 use wavefold::codec::Codec;
-use wavefold::dct_backend::{ComputeBackend, DctAlgorithm};
+use wavefold::dct_backend::ComputeBackend;
 use wavefold::media_backend::MediaBackendChoice;
 use wavefold::pipeline::{self, PipelineMsg};
 
@@ -45,10 +45,6 @@ enum Command {
         /// DCT compute backend. `cpu` needs no GPU at all (e.g. for CI runners).
         #[arg(long, value_enum, default_value_t = ComputeBackend::Gpu)]
         backend: ComputeBackend,
-        /// DCT algorithm (GPU backend only): the O(N log N) FFT-based path,
-        /// or the original O(N^2) matrix-multiply.
-        #[arg(long, value_enum, default_value_t = DctAlgorithm::Fft)]
-        dct_algorithm: DctAlgorithm,
         /// Decode/encode implementation. Only one exists today; this is the
         /// selector for when another is added.
         #[arg(long, value_enum, default_value_t = MediaBackendChoice::ALL[0])]
@@ -85,7 +81,6 @@ fn main() {
             cutoff,
             encoder,
             backend,
-            dct_algorithm,
             media_backend,
         } => {
             run_encode(
@@ -94,7 +89,6 @@ fn main() {
                 cutoff,
                 encoder,
                 backend,
-                dct_algorithm,
                 media_backend,
             );
         }
@@ -133,7 +127,6 @@ fn run_encode(
     cutoff: f32,
     encoder: Codec,
     backend: ComputeBackend,
-    dct_algorithm: DctAlgorithm,
     media_backend: MediaBackendChoice,
 ) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -144,7 +137,6 @@ fn run_encode(
             cutoff,
             encoder,
             backend,
-            dct_algorithm,
             media_backend,
             tx,
         )
