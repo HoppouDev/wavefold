@@ -412,6 +412,18 @@ fn run_inner(
 
     let appsink = gst_app::AppSink::builder()
         .caps(&gst::Caps::builder("video/x-raw").field("format", "RGB").build())
+        // `sync` defaults to `true` (inherited from `GstBaseSink`), which
+        // paces every pulled sample to the pipeline clock — i.e. throttles
+        // the whole decode/compute/encode chain to real-time (1x) playback
+        // speed regardless of how fast decode, GPU DCT compute, and encode
+        // could actually run. Confirmed: at 512x384 this alone accounted for
+        // a ~5.9x slowdown (measured 33.6ms/frame, exactly 1/30fps, whether
+        // decode/encode were hardware or software) and pinned GPU
+        // utilization near ~20% despite the GPU frame-pipelining fix above —
+        // disabling it let the same encode finish in ~5.7ms/frame with GPU
+        // utilization around 74-97%. This is an offline batch transcode, not
+        // playback, so nothing should be paced to wall-clock time at all.
+        .sync(false)
         .build();
     pipeline.add(&appsink).context("failed to add appsink")?;
     dec_convert.link(&appsink).context("failed to link videoconvert -> appsink")?;
