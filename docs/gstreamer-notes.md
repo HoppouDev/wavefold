@@ -222,6 +222,35 @@ kept it unchanged again for same reason.
   `matroskamux` has no such requirement and works fine.
   `tests/integration.rs` tolerates this specific combination as known
   muxer gap, same way it already tolerates hardware-encoder unavailability.
+- **Raw PCM audio input (e.g. some iOS/Instagram exports' 'ipcm' box)
+  gets static/garbled on stream-copy passthrough — fixed by re-encoding to
+  AAC instead.** Root cause: this GStreamer version's `qtmux`
+  (gst-plugins-good 1.28.6, confirmed against its own source) has no code
+  path to write anything but the legacy 'sowt'/'twos' fourcc for raw PCM
+  audio — no 'ipcm'/'lpcm' support at all in the muxer (only in
+  `qtdemux`'s read side). Output PCM bytes end up byte-identical to the
+  source (verified), but common players apparently mishandle/misinterpret
+  'sowt'/'twos' for >16-bit-depth PCM, producing static. Not fixable
+  muxer-side. Fix: `connect_pad_added`'s audio branch now checks
+  `name == "audio/x-raw"` — already-compressed audio (AAC/Opus/etc.)
+  still links `aud_queue` straight to the muxer's `audio_%u` pad,
+  byte-identical stream copy, completely unchanged; raw PCM instead links
+  through a small always-present-but-conditionally-used re-encode chain,
+  `aud_queue ! audioconvert ! avenc_aac !` muxer (`audioconvert` added
+  since raw PCM caps like S24LE won't necessarily match whatever sample
+  format `avenc_aac` wants). `avenc_aac` (GStreamer's `libav` plugin, from
+  `gst-libav`/`gstreamer1.0-libav`) needs no new runtime dependency —
+  AGENTS.md's system-dependencies section already mandates that package
+  for decoding. Confirmed empirically via `gst-launch-1.0` that
+  `avenc_aac`'s raw AAC output (`audio/mpeg, mpegversion=4,
+  stream-format=raw`) links directly into both `qtmux` and `matroskamux`
+  with no `aacparse` needed, unlike H.265/`h265parse`. `audioconvert`/
+  `avenc_aac` are added to the pipeline and statically linked to
+  `aud_queue` unconditionally at construction time (the raw-vs-compressed
+  decision only happens later, inside `connect_pad_added`) — harmless if
+  never used downstream, same tolerance already extended to `aud_queue`
+  itself for audio-less inputs. Verified against a real Instagram/iOS
+  export with 24-bit PCM audio (HEVC video, `.mov`→`.mp4`).
 - `split_rgb_planes`/`join_rgb_planes` parallelize per-row loops with
   `rayon` (`par_chunks_mut`) — each row disjoint read/write, no aliasing
   between them; unchanged in spirit from ffmpeg-next version, just

@@ -395,6 +395,30 @@ fn run_inner(
     // (still-encoded — see autoplug-continue below) audio pad. Not every
     // input has an audio stream, so this may simply never get used.
     let aud_queue = gst::ElementFactory::make("queue").build().context("failed to create audio queue")?;
+    // Raw-PCM audio re-encode chain, built unconditionally alongside
+    // `aud_queue` and statically linked to it right away, even though
+    // whether it's ever actually used is only decided later inside
+    // `connect_pad_added` (once decodebin exposes the audio pad and its
+    // caps are known) — the raw-vs-compressed branch can't be decided at
+    // construction time. An added-but-never-linked-downstream element pair
+    // is harmless, same tolerance this file already extends to `aud_queue`
+    // itself when an input has no audio at all. Only needed for the one
+    // input shape where decodebin's audio pad comes out already
+    // `audio/x-raw` (raw PCM) — see the doc comment on `autoplug-continue`
+    // below for why that specific case can't be a pure stream copy.
+    // `audioconvert` sits ahead of `avenc_aac` because raw PCM caps (e.g.
+    // S24LE) won't necessarily match whatever sample format `avenc_aac`
+    // wants — same role `venc_convert`/`dec_convert` play for video
+    // elsewhere in this file, letting negotiation pick the right format
+    // automatically instead of assuming one.
+    let aud_convert = gst::ElementFactory::make("audioconvert").build().context("failed to create audioconvert")?;
+    // `gstreamer1.0-libav`/`gst-libav` (which provides `avenc_aac`) is
+    // already a hard system dependency of this project — AGENTS.md's
+    // system-dependencies section mandates it for broad-codec *decoding*
+    // (default `openh264dec` can't handle every H.264 profile FFmpeg
+    // itself produces), so relying on `avenc_aac` here introduces no new
+    // runtime dependency beyond what already ships.
+    let aud_encoder = gst::ElementFactory::make("avenc_aac").build().context("failed to create avenc_aac")?;
     // Decode-side conversion: whatever format the decoder outputs -> RGB,
     // before frames reach appsink. Distinct from `venc_convert` above,
     // which converts DCT'd RGB back to the encoder's format on the way out.
@@ -407,7 +431,29 @@ fn run_inner(
     // returning. See `venc_pre_queue`'s doc comment above for the matching
     // encode-side half of this fix.
     let dec_queue = gst::ElementFactory::make("queue").build().context("failed to create decode queue")?;
-    pipeline.add_many([&aud_queue, &dec_queue, &dec_convert]).context("failed to add audio/decode-convert elements")?;
+    pipeline
+        .add_many([&aud_queue, &aud_convert, &aud_encoder, &dec_queue, &dec_convert])
+        .context("failed to add audio/decode-convert elements")?;
+    // Only `aud_convert -> aud_encoder` linked statically here —
+    // `aud_queue -> aud_convert` is deliberately NOT linked yet (deferred to
+    // `connect_pad_added`'s raw-PCM branch below), even though both would
+    // structurally succeed at construction time. Reason: `GstElement`'s
+    // default CAPS-query handling on an unlinked pad proxies through to
+    // that *same element's other pad* and returns its linked peer's caps if
+    // one exists. Linking `aud_queue`'s src to `aud_convert`'s sink (which
+    // only accepts `audio/x-raw`) this early would make `aud_queue`'s own
+    // *sink* pad's caps query answer `audio/x-raw` too, from then on —
+    // even though nothing has flowed and even for inputs whose audio is
+    // already-compressed. That poisons the *compressed*-audio passthrough
+    // case: decodebin's compressed audio pad (e.g. `audio/mpeg`) then fails
+    // to link to `aud_queue`'s sink at all ("no common format"), breaking
+    // stream-copy passthrough entirely (confirmed empirically — this exact
+    // bug reproduced 100% of the time against a real AAC-audio fixture
+    // before this comment/ordering existed). `aud_convert -> aud_encoder`
+    // has no such hazard: neither pad is ever queried via `aud_queue`, and
+    // both sides are audio/x-raw already, so this link is unconditionally
+    // safe up front.
+    aud_convert.link(&aud_encoder).context("failed to link audioconvert -> avenc_aac")?;
     dec_queue.link(&dec_convert).context("failed to link decode queue -> videoconvert")?;
 
     let appsink = gst_app::AppSink::builder()
@@ -664,9 +710,15 @@ fn run_inner(
     // decodebin decides whether to keep autoplugging based on this signal:
     // false => stop and expose the pad as-is (passthrough), true => keep
     // looking for a decoder. Video always continues (gets decoded); audio
-    // stops the moment it's no longer already raw, so it passes through to
-    // the muxer encoded — no decode/re-encode, matching the old
-    // ffmpeg-next path's pure stream-copy behavior.
+    // stops the moment it's no longer already raw. This logic itself is
+    // unchanged — the raw-vs-compressed *handling* differs downstream, in
+    // `connect_pad_added`: already-compressed audio (e.g. AAC/Opus) still
+    // passes straight through to the muxer with no decode/re-encode at all
+    // (pure stream copy, matching the old ffmpeg-next path's behavior), but
+    // an audio pad that comes out already `audio/x-raw` (raw PCM, e.g. some
+    // iOS/Instagram exports' 'ipcm' box) now gets re-encoded to AAC instead
+    // of stream-copied — see the doc comment on `aud_convert`/`aud_encoder`
+    // above for why.
     decodebin.connect("autoplug-continue", false, |values| {
         let caps = values[2].get::<gst::Caps>().expect("autoplug-continue arg 2 is not Caps");
         let name = caps.structure(0).map(|s| s.name()).unwrap_or_default();
@@ -679,6 +731,8 @@ fn run_inner(
         let appsrc_for_pad = appsrc.clone();
         let dec_queue_for_pad = dec_queue.clone();
         let aud_queue_for_pad = aud_queue.clone();
+        let aud_convert_for_pad = aud_convert.clone();
+        let aud_encoder_for_pad = aud_encoder.clone();
         let muxer_for_pad = muxer.clone();
         // NOTE: a *strong* clone of `pipeline` here would create a
         // reference cycle — this closure is stored inside `decodebin`,
@@ -749,7 +803,20 @@ fn run_inner(
                     error!("failed to link decoded video pad to decode queue: {e:?}");
                 }
             } else if name.starts_with("audio/") {
-                debug!("audio stream found: will pass through unchanged");
+                let is_raw = name == "audio/x-raw";
+                if is_raw {
+                    // See `aud_convert`/`aud_encoder`'s doc comment above:
+                    // this GStreamer version's `qtmux` can only write the
+                    // legacy 'sowt'/'twos' fourcc for raw PCM audio (no
+                    // 'ipcm'/'lpcm' support), which some players
+                    // misinterpret as static/garbled for >16-bit PCM —
+                    // re-encode to AAC instead of stream-copying it.
+                    info!("raw PCM audio stream found: re-encoding to AAC for compatibility");
+                    let _ = tx_for_pad
+                        .send(PipelineMsg::Log("raw PCM audio detected: re-encoding to AAC for compatibility".into()));
+                } else {
+                    debug!("audio stream found: will pass through unchanged");
+                }
                 let sinkpad = aud_queue_for_pad.static_pad("sink").expect("audio queue has no sink pad");
                 if sinkpad.is_linked() {
                     return;
@@ -762,9 +829,24 @@ fn run_inner(
                     error!("muxer has no audio pad template");
                     return;
                 };
-                let q_src = aud_queue_for_pad.static_pad("src").expect("audio queue has no src pad");
-                if let Err(e) = q_src.link(&mux_audio_sink) {
-                    error!("failed to link audio queue to muxer: {e:?}");
+                // `aud_queue -> aud_convert` links here, not at construction
+                // — see the doc comment above `aud_convert.link(&aud_encoder)`
+                // for why linking it any earlier would break the far more
+                // common already-compressed passthrough case.
+                let src_element = if is_raw {
+                    let q_src = aud_queue_for_pad.static_pad("src").expect("audio queue has no src pad");
+                    let conv_sink = aud_convert_for_pad.static_pad("sink").expect("audioconvert has no sink pad");
+                    if let Err(e) = q_src.link(&conv_sink) {
+                        error!("failed to link audio queue -> audioconvert: {e:?}");
+                        return;
+                    }
+                    &aud_encoder_for_pad
+                } else {
+                    &aud_queue_for_pad
+                };
+                let src = src_element.static_pad("src").expect("audio chain element has no src pad");
+                if let Err(e) = src.link(&mux_audio_sink) {
+                    error!("failed to link audio chain to muxer: {e:?}");
                 }
             }
         });
